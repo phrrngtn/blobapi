@@ -1,0 +1,39 @@
+# Connection configuration for blobapi catalog databases.
+#
+# Copy to connections.toml and fill in credentials.
+# connections.toml is .gitignored — never commit it.
+#
+# Each section is a named connection. The "dialect" field selects the
+# SQLAlchemy backend. All other fields are connection parameters.
+#
+# The [default] section is used when no --connection flag is given.
+
+[default]
+dialect = "sqlite"
+database = "blobapi.db"
+
+[sqlite]
+dialect = "sqlite"
+database = "blobapi.db"
+
+[duckdb]
+dialect = "duckdb"
+database = "blobapi.duckdb"
+
+[postgresql]
+dialect = "postgresql"
+host = "localhost"
+port = 5432
+database = "blobapi"
+username = "blobapi"
+password = "changeme"
+
+[sqlserver]
+dialect = "sqlserver"
+host = "localhost"
+port = 1433
+database = "blobapi"
+username = "sa"
+password = "changeme"
+driver = "ODBC Driver 18 for SQL Server"
+# trust_server_certificate = true  # for local Docker instances

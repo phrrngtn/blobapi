@@ -1,0 +1,22 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Local databases
+*.db
+*.duckdb
+
+# Credentials / connection config (template is connections.toml.example)
+connections.toml
+
+# Scraper state
+scraper_state.json
+
+# openapi-directory is a git submodule — do not ignore it

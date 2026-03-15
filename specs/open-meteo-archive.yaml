@@ -1,0 +1,211 @@
+openapi: "3.0.3"
+info:
+  title: Open-Meteo Historical Weather API
+  version: "1.0"
+  description: >
+    Free, open-source weather API providing historical weather data worldwide.
+    No API key required. Hourly and daily aggregations available.
+    Data sourced from national weather services and reanalysis models.
+  contact:
+    name: Open-Meteo
+    url: https://open-meteo.com
+  license:
+    name: CC BY 4.0
+    url: https://creativecommons.org/licenses/by/4.0/
+  x-providerName: open-meteo.com
+servers:
+  - url: https://archive-api.open-meteo.com
+    description: Historical archive API
+  - url: https://api.open-meteo.com
+    description: Forecast API (also supports past_days for recent history)
+paths:
+  /v1/archive:
+    get:
+      operationId: getHistoricalWeather
+      summary: Historical daily and hourly weather data for any location worldwide
+      description: >
+        Returns historical weather data for a single point specified by
+        latitude/longitude. Supports daily and hourly aggregation.
+        Date range can span from 1940 to 5 days before present.
+        No API key required.
+      parameters:
+        - name: latitude
+          in: query
+          required: true
+          schema:
+            type: number
+            format: float
+          description: WGS84 latitude (-90 to 90)
+        - name: longitude
+          in: query
+          required: true
+          schema:
+            type: number
+            format: float
+          description: WGS84 longitude (-180 to 180)
+        - name: start_date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+          description: Start date (YYYY-MM-DD). Earliest available is 1940-01-01.
+        - name: end_date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+          description: End date (YYYY-MM-DD). Up to 5 days before present.
+        - name: daily
+          in: query
+          required: false
+          schema:
+            type: string
+          description: >
+            Comma-separated list of daily variables. Available:
+            temperature_2m_max, temperature_2m_min, temperature_2m_mean,
+            apparent_temperature_max, apparent_temperature_min, apparent_temperature_mean,
+            precipitation_sum, rain_sum, showers_sum, snowfall_sum, precipitation_hours,
+            wind_speed_10m_max, wind_gusts_10m_max, wind_direction_10m_dominant,
+            shortwave_radiation_sum, et0_fao_evapotranspiration,
+            weather_code, sunrise, sunset, sunshine_duration, daylight_duration,
+            uv_index_max, uv_index_clear_sky_max
+        - name: hourly
+          in: query
+          required: false
+          schema:
+            type: string
+          description: >
+            Comma-separated list of hourly variables. Available:
+            temperature_2m, relative_humidity_2m, dew_point_2m,
+            apparent_temperature, pressure_msl, surface_pressure,
+            precipitation, rain, showers, snowfall, snow_depth,
+            weather_code, cloud_cover, wind_speed_10m, wind_direction_10m,
+            wind_gusts_10m, shortwave_radiation, direct_radiation,
+            diffuse_radiation, et0_fao_evapotranspiration, vapour_pressure_deficit,
+            soil_temperature_0cm, soil_moisture_0_to_1cm
+        - name: temperature_unit
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [celsius, fahrenheit]
+            default: celsius
+        - name: wind_speed_unit
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [kmh, ms, mph, kn]
+            default: kmh
+        - name: precipitation_unit
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [mm, inch]
+            default: mm
+        - name: timezone
+          in: query
+          required: false
+          schema:
+            type: string
+            default: GMT
+          description: IANA timezone (e.g., America/New_York). Affects daily aggregation boundaries.
+      responses:
+        "200":
+          description: Weather data for the requested location and date range
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  latitude:
+                    type: number
+                    description: Resolved latitude (may differ slightly from request due to grid snapping)
+                  longitude:
+                    type: number
+                    description: Resolved longitude
+                  generationtime_ms:
+                    type: number
+                    description: Server processing time in milliseconds
+                  utc_offset_seconds:
+                    type: integer
+                  timezone:
+                    type: string
+                  timezone_abbreviation:
+                    type: string
+                  elevation:
+                    type: number
+                  daily_units:
+                    type: object
+                    description: "Units for each daily variable"
+                  daily:
+                    type: object
+                    description: >
+                      Daily data arrays. Contains "time" (array of date strings)
+                      plus one array per requested variable. All arrays have the same length.
+                    properties:
+                      time:
+                        type: array
+                        items:
+                          type: string
+                          format: date
+                      temperature_2m_max:
+                        type: array
+                        items:
+                          type: number
+                      temperature_2m_min:
+                        type: array
+                        items:
+                          type: number
+                      temperature_2m_mean:
+                        type: array
+                        items:
+                          type: number
+                      precipitation_sum:
+                        type: array
+                        items:
+                          type: number
+                      snowfall_sum:
+                        type: array
+                        items:
+                          type: number
+                      wind_speed_10m_max:
+                        type: array
+                        items:
+                          type: number
+                  hourly_units:
+                    type: object
+                    description: Units for each hourly variable
+                  hourly:
+                    type: object
+                    description: >
+                      Hourly data arrays. Contains "time" (array of ISO datetime strings)
+                      plus one array per requested variable.
+                    properties:
+                      time:
+                        type: array
+                        items:
+                          type: string
+                          format: date-time
+                      temperature_2m:
+                        type: array
+                        items:
+                          type: number
+                      relative_humidity_2m:
+                        type: array
+                        items:
+                          type: number
+        "400":
+          description: Invalid request (bad coordinates, date range, or variable names)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: boolean
+                  reason:
+                    type: string
