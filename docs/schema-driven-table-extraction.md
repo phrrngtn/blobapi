@@ -1,0 +1,143 @@
+# Schema-Driven Table Extraction
+
+Finding tables in documents when you know what you're looking for but not
+exactly where it is or what format it's in.
+
+## Problem
+
+Pricing data, financial tables, technical specifications, and other
+structured data are published in HTML pages, PDFs, Excel workbooks, and
+Word documents. The data we want is tabular, but:
+
+- It may not be in `<table>` elements (CSS grid, `<div>` layouts, Shadow DOM)
+- It may be one of many tables on a page (nav tables, layout tables, etc.)
+- The column names may differ from our schema ("Price per MTok" vs "input_per_mtok")
+- The document format varies (HTML, PDF, XLSX, DOCX)
+- The precision of what we know about the target varies from "it's a table
+  with numbers" to "it matches this exact JSON Schema"
+
+The current pricing scraper pipeline (Jina + `X-Target-Selector: table` +
+LLM extraction) works when the data is in HTML tables. It fails for
+Shadow DOM, JS-rendered layouts, and non-HTML documents.
+
+## Idea: Variable Resolution Schema Matching
+
+Instead of hardcoding extraction logic per document type, define **what
+we're looking for** at whatever level of precision we have, and let the
+system find candidate regions that match.
+
+### Resolution levels
+
+From loosest to most precise:
+
+1. **Column hints**: a bag of plausible column names and rough data types
+   ```yaml
+   columns:
+     - name_hints: [model, model_id, model_name]
+       type: string
+     - name_hints: [input, input_price, input_cost, prompt]
+       type: number
+     - name_hints: [output, output_price, output_cost, completion]
+       type: number
+   ```
+
+2. **Typed schema**: column names + types + constraints
+   ```yaml
+   columns:
+     - name: model_id
+       type: string
+       pattern: "^[a-z]"
+     - name: input_per_mtok
+       type: number
+       minimum: 0
+       maximum: 1000
+   ```
+
+3. **JSON Schema**: full Draft 2020-12 schema with validation
+   (this is what `llm_model_cost.yaml` already uses for the output)
+
+4. **Domain-annotated schema**: columns carry semantic domain labels
+   from the blobfilters domain registry (e.g., `domain: model_identifier`,
+   `domain: price_per_mtok`). The domain label connects to world knowledge
+   about what values look like, what units are expected, and what
+   functional dependencies exist.
+
+### How it connects to the blob* extensions
+
+| Extension | Role in table extraction |
+|---|---|
+| **blobrange** | Find candidate rectangular regions in a document. Score each region against the schema at whatever resolution is available. Return ranked candidates with confidence scores. |
+| **blobboxes** | Spatial layout analysis for PDFs — bounding boxes, reading order, cell boundaries. Feeds candidate regions to blobrange. |
+| **blobfilters** | Domain registry — semantic type labels (`model_identifier`, `price_per_mtok`, `currency_code`). Enables matching by meaning, not just by column name string similarity. |
+| **blobtemplates** | JMESPath reshaping of extracted data into the target schema. The same `response_jmespath` pattern used in LLM adapters. |
+| **blobhttp** | Fetch documents (Jina Reader for HTML, direct download for PDF/XLSX). |
+| **blobapi** | Catalog of known schemas (what we're looking for) and adapters (how to reshape what we find). |
+
+### Extraction pipeline
+
+```
+Document (HTML / PDF / XLSX / DOCX)
+  │
+  ├─ blobboxes: spatial analysis → candidate regions
+  │  (bounding boxes, cell boundaries, reading order)
+  │
+  ├─ blobrange: schema matching → ranked candidates
+  │  (score each region against the target schema)
+  │  (resolution 1: column name fuzzy match + type check)
+  │  (resolution 2: value range/pattern validation)
+  │  (resolution 3: full JSON Schema validation)
+  │  (resolution 4: domain-aware semantic matching)
+  │
+  ├─ blobtemplates: reshape → target schema
+  │  (JMESPath or column mapping)
+  │
+  └─ LLM (optional): disambiguate → final extraction
+     (only needed when structural matching is ambiguous)
+     (the LLM sees only the candidate region, not the whole doc)
+```
+
+The key insight is that the LLM is the **last resort**, not the first
+step. Structural matching (blobrange + blobboxes) handles the common
+cases cheaply. The LLM handles the ambiguous cases — but it sees only
+a small candidate region, not the entire 218k-token document.
+
+### Current state (pricing scraper)
+
+The pricing scraper is an early instance of this pattern:
+
+| Step | Current implementation | Future (schema-driven) |
+|---|---|---|
+| Document fetch | Jina Reader (`bh_http_get` + `r.jina.ai/`) | Same, plus PDF/XLSX readers |
+| Region selection | `X-Target-Selector: table` (CSS) | blobrange schema matching |
+| Extraction | LLM parses entire page | LLM sees only matched region |
+| Validation | jsoncons JSON Schema | Same |
+| Reshaping | JMESPath | Same |
+
+### Why this matters for the broken providers
+
+The 4 providers where Jina + table selector fails (Mistral, DeepSeek,
+xAI, Cohere) all have pricing data that isn't in `<table>` elements.
+With schema-driven extraction:
+
+- **Resolution 1** (column hints) would find the pricing data in `<div>`
+  grids, definition lists, or inline text by recognizing patterns like
+  "model name followed by dollar amounts"
+- **blobrange** would score these non-table regions against the pricing
+  schema and surface them as candidates
+- The **LLM** would only need to parse a small, already-identified region
+
+This is a general solution — the same machinery works for extracting
+financial tables from SEC filings (PDF), product specs from datasheets
+(XLSX), or API pricing from any web page regardless of how it's rendered.
+
+### Relation to domain inference
+
+The `domain_inference` LLM adapter (already in blobapi) classifies columns
+by semantic domain. This feeds directly into resolution level 4: if we
+know that a column's domain is `price_per_mtok`, we can match it against
+candidate regions even when the column header says "Cost" or "Rate" or
+uses a completely different language.
+
+The domain registry in blobfilters (via Rule4 extended properties) stores
+these labels persistently. The `domain_inference` adapter discovers them;
+blobrange uses them for matching; the circle closes.
