@@ -24,9 +24,10 @@
 
     For each model listed on the page, return:
     - model_id: the API model identifier, prefixed with "{{ provider }}/"
-      (e.g. "anthropic/claude-sonnet-4-6"). Use the shortest canonical
-      API identifier, not marketing names or dated suffixes unless those
-      are the only identifiers shown.
+      (e.g. "anthropic/claude-sonnet-4-6"). Use dashes between version
+      numbers (4-6 not 4.6). Use the shortest canonical API identifier,
+      not marketing names or dated suffixes unless those are the only
+      identifiers shown.
     - input_per_mtok: input cost in USD per million tokens
     - output_per_mtok: output cost in USD per million tokens
     - cache_write_5m_per_mtok: 5-minute prompt cache write cost per MTok (null if not listed)
