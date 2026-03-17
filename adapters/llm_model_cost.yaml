@@ -1,0 +1,75 @@
+# llm_model_cost adapter: extract model pricing from a provider's pricing page.
+#
+# Input params:
+#   provider:     provider name (e.g. "anthropic")
+#   pricing_page: the full text/markdown of the provider's pricing page
+#
+# The caller is responsible for fetching the pricing page (via bh_http_get
+# or read_text) and passing it as the pricing_page param. This keeps the
+# adapter stateless and testable — the LLM extracts structured data from
+# the page content rather than relying on its training data.
+#
+# Output: list-of-dicts with per-model pricing in USD per million tokens.
+
+- name: llm_model_cost
+
+  prompt_template: |
+    You are a pricing data extraction assistant. Below is the content of
+    the "{{ provider }}" model pricing page. Extract ALL model pricing
+    into the structured format specified.
+
+    <pricing_page>
+    {{ pricing_page }}
+    </pricing_page>
+
+    For each model listed on the page, return:
+    - model_id: the API model identifier, prefixed with "{{ provider }}/"
+      (e.g. "anthropic/claude-sonnet-4-6"). Use the shortest canonical
+      API identifier, not marketing names or dated suffixes unless those
+      are the only identifiers shown.
+    - input_per_mtok: input cost in USD per million tokens
+    - output_per_mtok: output cost in USD per million tokens
+    - cache_write_5m_per_mtok: 5-minute prompt cache write cost per MTok (null if not listed)
+    - cache_write_1h_per_mtok: 1-hour prompt cache write cost per MTok (null if not listed)
+    - cache_read_per_mtok: prompt cache read/hit cost per MTok (null if not listed)
+    - batch_input_per_mtok: batch API input cost per MTok (null if not listed)
+    - batch_output_per_mtok: batch API output cost per MTok (null if not listed)
+
+    Rules:
+    - Extract ONLY what is explicitly stated on the page. Do NOT infer or calculate.
+    - If batch pricing is in a separate table, merge it with the main model row.
+    - Use null (not 0) for pricing tiers not listed on the page.
+    - Omit deprecated models.
+    - All prices must be in USD per million tokens.
+
+  output_schema:
+    type: object
+    required: [models]
+    properties:
+      models:
+        type: array
+        items:
+          type: object
+          required: [model_id, input_per_mtok, output_per_mtok]
+          properties:
+            model_id:
+              type: string
+            input_per_mtok:
+              type: number
+            output_per_mtok:
+              type: number
+            cache_write_5m_per_mtok:
+              type: ["number", "null"]
+            cache_write_1h_per_mtok:
+              type: ["number", "null"]
+            cache_read_per_mtok:
+              type: ["number", "null"]
+            batch_input_per_mtok:
+              type: ["number", "null"]
+            batch_output_per_mtok:
+              type: ["number", "null"]
+          additionalProperties: false
+    additionalProperties: false
+
+  response_jmespath: "models"
+  max_tokens: 4096

@@ -22,7 +22,7 @@ Dialect notes:
 
 from datetime import datetime, timezone
 
-from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Identity, Index, Integer, String, Text, UniqueConstraint, event
+from sqlalchemy import JSON, Boolean, DateTime, Float, ForeignKey, Identity, Index, Integer, String, Text, UniqueConstraint, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
 
@@ -342,4 +342,133 @@ class ApiAdapter(TemporalMixin, Base):
         UniqueConstraint("provider", "api_name", "path", "method", "sys_from",
                         name="uq_adapter_identity"),
         Index("ix_adapter_provider", "provider", "api_name"),
+    )
+
+
+# ---------------------------------------------------------------------------
+# LLM adapter: inja prompt templates for LLM-backed reified functions
+# ---------------------------------------------------------------------------
+
+class LlmAdapter(Base):
+    """
+    Reified LLM function definition.
+
+    Each row drives the llm_adapt() DuckDB macro: an inja prompt template,
+    a JSON Schema for output validation, and a JMESPath expression to
+    reshape the validated response.
+
+    Session-scoped: lives in DuckDB/SQLite during a query session.
+    Loaded from YAML files in adapters/ (those with prompt_template keys).
+    """
+
+    __tablename__ = "llm_adapter"
+
+    name: Mapped[str] = mapped_column(String(200), primary_key=True)
+    prompt_template: Mapped[str] = mapped_column(
+        Text, doc="Inja/Jinja2 template, rendered with caller params"
+    )
+    output_schema: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        doc="JSON Schema (Draft 2020-12) for response validation",
+    )
+    response_jmespath: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        doc="JMESPath expression to reshape validated JSON",
+    )
+    max_tokens: Mapped[int] = mapped_column(Integer, default=4096)
+
+
+# ---------------------------------------------------------------------------
+# LLM pricing: per-model token costs (session-scoped reference table)
+# ---------------------------------------------------------------------------
+
+class LlmPricing(Base):
+    """
+    Per-model token pricing in USD per million tokens.
+
+    Session-scoped: lives in DuckDB/SQLite, loaded from YAML or Bifrost.
+    Used for cost accounting by joining against _meta from llm_adapt() results.
+    """
+
+    __tablename__ = "llm_pricing"
+
+    model: Mapped[str] = mapped_column(String(200), primary_key=True)
+    input_per_mtok: Mapped[float] = mapped_column(
+        Float, doc="Standard input cost, USD per MTok"
+    )
+    output_per_mtok: Mapped[float] = mapped_column(
+        Float, doc="Standard output cost, USD per MTok"
+    )
+    cache_write_5m_per_mtok: Mapped[float | None] = mapped_column(
+        Float, nullable=True, doc="5-minute prompt cache write, USD per MTok"
+    )
+    cache_write_1h_per_mtok: Mapped[float | None] = mapped_column(
+        Float, nullable=True, doc="1-hour prompt cache write, USD per MTok"
+    )
+    cache_read_per_mtok: Mapped[float | None] = mapped_column(
+        Float, nullable=True, doc="Prompt cache read/hit, USD per MTok"
+    )
+    batch_input_per_mtok: Mapped[float | None] = mapped_column(
+        Float, nullable=True, doc="Batch API input cost, USD per MTok"
+    )
+    batch_output_per_mtok: Mapped[float | None] = mapped_column(
+        Float, nullable=True, doc="Batch API output cost, USD per MTok"
+    )
+
+
+# ---------------------------------------------------------------------------
+# LLM model price history: TTST of pricing snapshots (high-ceremony DB)
+# ---------------------------------------------------------------------------
+
+class LlmModelPriceHistory(TemporalMixin, Base):
+    """
+    Transaction-time system table of LLM model pricing.
+
+    Tracks pricing changes over time using sys_from/sys_to (from TemporalMixin).
+    The current price for a model is the row where sys_to IS NULL.
+
+    Snapshot workflow:
+      1. Fetch current prices from Bifrost /v1/models (or YAML fallback)
+      2. Compare each model against the current row (sys_to IS NULL)
+      3. If prices differ: close the old row (sys_to = now), insert new row
+      4. If prices match: no-op (idempotent)
+
+    sys_from is an upper bound on when the price actually changed — the
+    real change happened between this snapshot and the previous one.
+
+    Lives on PostgreSQL/SQL Server — the persistent catalog, not a session
+    table.
+    """
+
+    __tablename__ = "llm_model_price_history"
+
+    price_history_id: Mapped[int] = mapped_column(
+        Integer, Identity(), primary_key=True
+    )
+    model: Mapped[str] = mapped_column(
+        String(200), doc="Provider-prefixed model ID, e.g. anthropic/claude-sonnet-4-6"
+    )
+    input_per_mtok: Mapped[float] = mapped_column(Float)
+    output_per_mtok: Mapped[float] = mapped_column(Float)
+    cache_write_5m_per_mtok: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    cache_write_1h_per_mtok: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    cache_read_per_mtok: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    batch_input_per_mtok: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+    batch_output_per_mtok: Mapped[float | None] = mapped_column(
+        Float, nullable=True
+    )
+
+    __table_args__ = (
+        # Only one current row per model (partial unique index on PG,
+        # enforced by application logic on SQL Server)
+        Index("ix_price_history_model", "model"),
+        Index("ix_price_history_current", "model", "sys_to"),
     )
