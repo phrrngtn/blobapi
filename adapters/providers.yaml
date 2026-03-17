@@ -4,23 +4,18 @@
 # prefix before "/" in model IDs like "anthropic/claude-opus-4-6"),
 # display name, and a map of well-known URLs.
 #
-# URL categories:
-#   pricing:  published pricing page (for scraping via Jina Reader)
-#   models:   machine-readable models/pricing endpoint (if available)
-#   billing:  console billing/usage page (for human reference)
-#   docs:     API documentation
-#
 # Fetch pipeline for pricing scrapes:
 #   1. Prepend "https://r.jina.ai/" to the pricing URL → clean markdown
 #   2. Send Jina headers (target_selector, remove_selector) to narrow content
-#   3. Pass markdown to llm_model_cost adapter for structured extraction
+#   3. Pass markdown to llm_adapt('llm_model_cost') for structured extraction
 #
-# Jina headers (per provider):
-#   target_selector:  CSS selector for elements to extract (e.g. "table")
-#   remove_selector:  CSS selector for elements to strip (e.g. "nav, footer")
+# scrape_status: tested | untested | broken (reason)
+
+# --- Tested and working ---
 
 - provider: anthropic
   display_name: Anthropic
+  scrape_status: tested
   jina:
     target_selector: table
     remove_selector: nav, footer, .sidebar
@@ -32,21 +27,30 @@
 
 - provider: openai
   display_name: OpenAI
+  scrape_status: tested
+  jina:
+    target_selector: table
   urls:
-    pricing: https://openai.com/api/pricing/
+    pricing: https://platform.openai.com/docs/pricing
     models: https://api.openai.com/v1/models
     billing: https://platform.openai.com/usage
     docs: https://platform.openai.com/docs/api-reference
 
 - provider: gemini
   display_name: Google Gemini
+  scrape_status: tested
+  jina:
+    target_selector: table
   urls:
     pricing: https://ai.google.dev/pricing
     models: https://generativelanguage.googleapis.com/v1/models
     docs: https://ai.google.dev/gemini-api/docs
 
+# --- Broken or untested ---
+
 - provider: mistral
   display_name: Mistral AI
+  scrape_status: "broken: JS-rendered pricing, Jina returns empty with table selector"
   urls:
     pricing: https://mistral.ai/products/la-plateforme#pricing
     models: https://api.mistral.ai/v1/models
@@ -54,18 +58,21 @@
 
 - provider: cohere
   display_name: Cohere
+  scrape_status: untested
   urls:
     pricing: https://cohere.com/pricing
     docs: https://docs.cohere.com/
 
 - provider: xai
   display_name: xAI
+  scrape_status: "broken: model pricing not in table elements, garbled layout"
   urls:
-    pricing: https://docs.x.ai/docs/models#models-and-pricing
+    pricing: https://docs.x.ai/docs/models
     docs: https://docs.x.ai/
 
 - provider: deepseek
   display_name: DeepSeek
+  scrape_status: "broken: pricing is inline text not tables, URL redirects"
   urls:
-    pricing: https://platform.deepseek.com/api-docs/pricing
+    pricing: https://api-docs.deepseek.com/quick_start/pricing
     docs: https://platform.deepseek.com/api-docs
