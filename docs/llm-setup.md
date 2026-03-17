@@ -391,3 +391,42 @@ other providers get NULL for these columns):
 | Cache read (hit) | 0.1x | base input |
 | Batch input | 0.5x | base input |
 | Batch output | 0.5x | base output |
+
+### Model ID normalization
+
+LLM extraction from pricing pages produces marketing-style names
+("Claude Opus 4.6" → `anthropic/claude-opus-4.6`) while the API uses
+dashes (`claude-opus-4-6`). The `model_id` module normalizes:
+
+- Dots to dashes in version numbers (`4.6` → `4-6`)
+- Matches against known canonical IDs from the TTST
+- Prefix matching for dated variants (`claude-opus-4-6` →
+  `claude-opus-4-6-20250514` if the undated form isn't canonical)
+
+This runs automatically in the Python scraper. The canonical form is
+whatever the provider's API returns (and what Bifrost registers).
+
+### Operational DuckDB: MERGE from high-ceremony DB
+
+An operational DuckDB instance that runs real queries can pull current
+pricing from the high-ceremony TTST via ODBC:
+
+```sql
+-- Load the ODBC extension and create local pricing table
+LOAD 'blobodbc';
+.read sql/create_llm_pricing.sql
+.read sql/merge_pricing_from_ttst.sql
+
+-- Pull current prices from PostgreSQL
+SELECT * FROM merge_pricing_from_ttst('my_pg_dsn');
+```
+
+The TTST is append-only, so the MERGE is safe to run at any time. It
+fetches all rows where `sys_to IS NULL` (current prices) and upserts
+them into the local `llm_pricing` table. The local table is a simple
+(non-temporal) snapshot used for cost accounting joins.
+
+This separation means:
+- **Python scraper** writes to the high-ceremony DB (source of truth)
+- **Operational DuckDB** reads from it via ODBC (local cache)
+- No coordination needed — pull whenever you want fresh prices

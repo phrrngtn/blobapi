@@ -19,6 +19,7 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from blobapi.model_id import normalize_model_id
 from blobapi.models import LlmModelPriceHistory, LlmProvider
 
 log = logging.getLogger(__name__)
@@ -198,6 +199,16 @@ def scrape_provider(
         log.error("LLM extraction failed for %s: %s", provider_slug, e)
         return {"inserted": 0, "skipped": 0, "closed": 0, "errors": 1}
 
+    # Build canonical ID set from existing TTST rows for this provider
+    existing_ids = set(
+        row[0] for row in session.execute(
+            select(LlmModelPriceHistory.model).filter(
+                LlmModelPriceHistory.model.startswith(provider_slug + "/"),
+                LlmModelPriceHistory.sys_to.is_(None),
+            )
+        ).all()
+    )
+
     inserted = 0
     skipped = 0
     closed = 0
@@ -206,6 +217,8 @@ def scrape_provider(
         model_id = m.get("model_id")
         if not model_id or m.get("input_per_mtok") is None:
             continue
+
+        model_id = normalize_model_id(model_id, canonical_ids=existing_ids)
 
         row_data = {
             "input_per_mtok": m["input_per_mtok"],

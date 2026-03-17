@@ -71,7 +71,10 @@ def load_providers(session: Session, yaml_path: Path, now: datetime) -> int:
     for entry in entries:
         slug = entry["provider"]
         display_name = entry.get("display_name")
-        urls = entry.get("urls")
+        urls = dict(entry.get("urls") or {})
+        # Merge jina config into urls for single-column storage
+        if "jina" in entry:
+            urls["jina"] = entry["jina"]
 
         existing = session.execute(
             select(LlmProvider).filter_by(provider=slug, sys_to=None)
