@@ -346,6 +346,40 @@ class ApiAdapter(TemporalMixin, Base):
 
 
 # ---------------------------------------------------------------------------
+# LLM provider: reference data for pricing sources and billing URLs
+# ---------------------------------------------------------------------------
+
+class LlmProvider(TemporalMixin, Base):
+    """
+    LLM provider reference data.
+
+    Each row defines a provider with its canonical slug (matching the prefix
+    before "/" in model IDs like "anthropic/claude-opus-4-6"), display name,
+    and a JSON map of well-known URLs (pricing page, models endpoint, billing
+    console, docs).
+
+    Lives on PostgreSQL/SQL Server. Loaded from adapters/providers.yaml.
+    """
+
+    __tablename__ = "llm_provider"
+
+    provider_id: Mapped[int] = mapped_column(Integer, Identity(), primary_key=True)
+    provider: Mapped[str] = mapped_column(
+        String(200), doc="Canonical slug, e.g. anthropic, openai, gemini"
+    )
+    display_name: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    urls: Mapped[dict | None] = mapped_column(
+        JSON, nullable=True,
+        doc="Freeform URL map: {pricing, models, billing, docs, ...}",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("provider", "sys_from", name="uq_provider_identity"),
+        Index("ix_provider_slug", "provider"),
+    )
+
+
+# ---------------------------------------------------------------------------
 # LLM adapter: inja prompt templates for LLM-backed reified functions
 # ---------------------------------------------------------------------------
 

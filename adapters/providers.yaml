@@ -1,0 +1,59 @@
+# LLM provider reference data.
+#
+# Each entry defines a provider with its canonical slug (matching the
+# prefix before "/" in model IDs like "anthropic/claude-opus-4-6"),
+# display name, and a map of well-known URLs.
+#
+# URL categories:
+#   pricing:  published pricing page (for scraping)
+#   models:   machine-readable models/pricing endpoint (if available)
+#   billing:  console billing/usage page (for human reference)
+#   docs:     API documentation
+
+- provider: anthropic
+  display_name: Anthropic
+  urls:
+    pricing: https://platform.claude.com/docs/en/about-claude/pricing
+    models: https://api.anthropic.com/v1/models
+    billing: https://console.anthropic.com/settings/billing
+    docs: https://platform.claude.com/docs/en/api/getting-started
+
+- provider: openai
+  display_name: OpenAI
+  urls:
+    pricing: https://openai.com/api/pricing/
+    models: https://api.openai.com/v1/models
+    billing: https://platform.openai.com/usage
+    docs: https://platform.openai.com/docs/api-reference
+
+- provider: gemini
+  display_name: Google Gemini
+  urls:
+    pricing: https://ai.google.dev/pricing
+    models: https://generativelanguage.googleapis.com/v1/models
+    docs: https://ai.google.dev/gemini-api/docs
+
+- provider: mistral
+  display_name: Mistral AI
+  urls:
+    pricing: https://mistral.ai/products/la-plateforme#pricing
+    models: https://api.mistral.ai/v1/models
+    docs: https://docs.mistral.ai/
+
+- provider: cohere
+  display_name: Cohere
+  urls:
+    pricing: https://cohere.com/pricing
+    docs: https://docs.cohere.com/
+
+- provider: xai
+  display_name: xAI
+  urls:
+    pricing: https://docs.x.ai/docs/models#models-and-pricing
+    docs: https://docs.x.ai/
+
+- provider: deepseek
+  display_name: DeepSeek
+  urls:
+    pricing: https://platform.deepseek.com/api-docs/pricing
+    docs: https://platform.deepseek.com/api-docs
