@@ -1,8 +1,7 @@
-# LLM Demo Setup
+# Services and Dependencies
 
-This document describes the services and configuration needed to run the
-`physical_properties` demo (and other LLM-backed reified functions) from
-DuckDB via the blobhttp extension.
+This document describes the external services that blobapi depends on for
+LLM-backed reified functions, pricing scrapes, and cost accounting.
 
 ## Architecture
 
@@ -122,6 +121,66 @@ signed by the DuckDB extension registry).
 |-----------------|-------------------------|-------------------------------------------------|
 | `bhttp`         | `../blobhttp/build/release/extension/bhttp/bhttp.duckdb_extension` | HTTP client, `_llm_adapt_raw`, `_llm_complete_raw`, rate limiting, Vault integration |
 | `blobtemplates` | `../blobtemplates/build/duckdb/blobtemplates.duckdb_extension`       | `bt_template_render` (inja), `bt_yaml_to_json`, `bt_jmespath` |
+
+> **blobhttp dependency**: blobapi has a hard dependency on blobhttp for all
+> HTTP and LLM functionality. For proxy (mitmproxy) and secret management
+> (OpenBao) setup, see the
+> [blobhttp dev-setup guide](https://github.com/phrrngtn/blobhttp/blob/main/docs/dev-setup.md).
+
+### 4. Jina Reader (Web Scraping)
+
+**What**: Converts any URL to clean markdown by rendering JavaScript,
+stripping navigation/boilerplate, and returning just the content. Used by the
+pricing scraper to extract tables from provider pricing pages.
+
+**URL pattern**: `https://r.jina.ai/{target_url}`
+
+**No API key required** for basic use (20 requests/minute free tier).
+
+**Key headers**:
+
+| Header | Purpose | Example |
+|---|---|---|
+| `X-Target-Selector` | CSS selector — extract only matching elements | `table` |
+| `X-Remove-Selector` | CSS selector — strip before extraction | `nav, footer, .sidebar` |
+
+**Why Jina**: Provider pricing pages are typically JS-rendered SPAs.
+Plain HTTP fetch returns a JavaScript bundle, not rendered content.
+Jina handles the rendering and returns compact markdown — the Anthropic
+pricing page goes from 218k tokens (raw HTML) to ~1,500 tokens
+(tables only via `X-Target-Selector: table`).
+
+**Usage from SQL** (via blobhttp):
+
+```sql
+SELECT bh_http_get(
+    'https://r.jina.ai/https://platform.claude.com/docs/en/about-claude/pricing',
+    headers := MAP {
+        'X-Target-Selector': 'table',
+        'X-Remove-Selector': 'nav, footer, .sidebar'
+    }
+).response_body;
+```
+
+**Usage from Python** (via httpx):
+
+```python
+resp = httpx.get(
+    "https://r.jina.ai/https://platform.claude.com/docs/en/about-claude/pricing",
+    headers={"X-Target-Selector": "table"},
+)
+markdown = resp.text  # Clean markdown tables, ~4.7k chars
+```
+
+**Jina config per provider** is stored in `adapters/providers.yaml` under
+the `jina` key:
+
+```yaml
+- provider: anthropic
+  jina:
+    target_selector: table
+    remove_selector: nav, footer, .sidebar
+```
 
 ## Running the Demo
 
