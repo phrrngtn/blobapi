@@ -1,48 +1,46 @@
--- Merge pricing from a high-ceremony database (PG/SQL Server) into a
--- local DuckDB llm_pricing table via ODBC.
+-- Read current pricing from a high-ceremony database (PG/SQL Server) via blobodbc.
 --
 -- The high-ceremony llm_model_price_history table is append-only (TTST).
--- Current rows have sys_to IS NULL. This query fetches only current rows
--- and merges them into the local session table, which is a simple
--- (non-temporal) reference table used for cost accounting.
+-- Current rows have sys_to IS NULL. This macro fetches them as JSON via
+-- bo_query and returns a relational table.
 --
 -- Prerequisites:
---   - blobodbc or nanodbc extension loaded (for odbc_query)
---   - DSN configured for the high-ceremony database
---   - Local llm_pricing table created (sql/create_llm_pricing.sql)
+--   - blobodbc extension loaded
+--
+-- Connection string formats:
+--   PostgreSQL DSN:  'DSN=rule4_test'
+--   SQL Server:      read from connections.toml, not hardcoded in SQL
 --
 -- Usage:
---   SET VARIABLE pricing_dsn = 'my_pg_dsn';
---   .read sql/merge_pricing_from_ttst.sql
+--   -- Read-only (inspect what's on the high-ceremony DB)
+--   SELECT * FROM ttst_current_pricing('DSN=rule4_test');
 --
--- Or inline:
---   SELECT * FROM merge_pricing_from_ttst('my_pg_dsn');
+--   -- Merge into local llm_pricing table
+--   INSERT OR REPLACE INTO llm_pricing
+--   SELECT * FROM ttst_current_pricing('DSN=rule4_test');
 
--- Macro that fetches current prices from the TTST via ODBC and returns
--- them as a table. Use this for inspection before merging.
-CREATE OR REPLACE MACRO ttst_current_pricing(dsn) AS TABLE (
-    SELECT * FROM odbc_query(dsn, '
-        SELECT model,
-               input_per_mtok,
-               output_per_mtok,
-               cache_write_5m_per_mtok,
-               cache_write_1h_per_mtok,
-               cache_read_per_mtok,
-               batch_input_per_mtok,
-               batch_output_per_mtok
-        FROM llm_model_price_history
-        WHERE sys_to IS NULL
-    ')
-);
-
--- Merge: INSERT OR REPLACE current TTST rows into local llm_pricing.
--- This is a full refresh — all current rows are upserted.
--- The local table has no temporal columns (it's a session-scoped snapshot).
-CREATE OR REPLACE MACRO merge_pricing_from_ttst(dsn) AS TABLE (
-    WITH REMOTE_PRICING AS (
-        SELECT * FROM ttst_current_pricing(dsn)
+CREATE OR REPLACE MACRO ttst_current_pricing(conn_str) AS TABLE (
+    WITH REMOTE_JSON AS (
+        SELECT bo_query(conn_str,
+            'SELECT model, input_per_mtok, output_per_mtok,
+                    cache_write_5m_per_mtok, cache_write_1h_per_mtok,
+                    cache_read_per_mtok, batch_input_per_mtok,
+                    batch_output_per_mtok
+             FROM llm_model_price_history
+             WHERE sys_to IS NULL') AS j
+    ),
+    REMOTE_ROWS AS (
+        SELECT unnest(from_json(CAST(j AS JSON), '["json"]')) AS r
+        FROM REMOTE_JSON
     )
-    INSERT OR REPLACE INTO llm_pricing
-    SELECT * FROM REMOTE_PRICING
-    RETURNING *
+    SELECT
+        r->>'$.model'                                  AS model,
+        CAST(r->>'$.input_per_mtok' AS FLOAT)          AS input_per_mtok,
+        CAST(r->>'$.output_per_mtok' AS FLOAT)         AS output_per_mtok,
+        CAST(r->>'$.cache_write_5m_per_mtok' AS FLOAT) AS cache_write_5m_per_mtok,
+        CAST(r->>'$.cache_write_1h_per_mtok' AS FLOAT) AS cache_write_1h_per_mtok,
+        CAST(r->>'$.cache_read_per_mtok' AS FLOAT)     AS cache_read_per_mtok,
+        CAST(r->>'$.batch_input_per_mtok' AS FLOAT)    AS batch_input_per_mtok,
+        CAST(r->>'$.batch_output_per_mtok' AS FLOAT)   AS batch_output_per_mtok
+    FROM REMOTE_ROWS
 );
