@@ -21,12 +21,12 @@ The entire pipeline — vault secret retrieval, URL construction, HTTP call, res
 ```sql
 WITH CREDS AS (
     SELECT json_extract(
-        (http_get('http://vault:8200/v1/secret/data/blobapi/geocodio',
+        (bh_http_get('http://vault:8200/v1/secret/data/blobapi/geocodio',
             headers := MAP {'X-Vault-Token': token}
         )).response_body, '$.data.data') AS secret
 ),
 LOCATION AS (
-    SELECT (http_get(
+    SELECT (bh_http_get(
         json_extract_string(secret, '$.base_url') || '/geocode',
         params := json_object('q', '02458', 'api_key',
                               json_extract_string(secret, '$.api_key'))
@@ -38,7 +38,7 @@ SELECT
 FROM LOCATION;
 ```
 
-No stored procedures, no application code, no ORM. Each CTE is one step: get the credential, make the call, extract the result. Because `http_get` is a scalar function, it composes with `json_extract`, `jmespath_search`, and every other expression in the SELECT list.
+No stored procedures, no application code, no ORM. Each CTE is one step: get the credential, make the call, extract the result. Because `bh_http_get` is a scalar function, it composes with `json_extract`, `jmespath_search`, and every other expression in the SELECT list.
 
 ### Metadata-driven adapters
 
@@ -76,7 +76,7 @@ The adapter table is also temporal — when an API changes its response shape an
 
 ### Secret management
 
-API keys are stored in [OpenBao](https://openbao.org) (open-source Vault fork) and retrieved via `http_get` in SQL. The scoped `http_config` mechanism in blobhttp can inject bearer tokens automatically for URL prefixes, so authenticated API calls look identical to unauthenticated ones.
+API keys are stored in [OpenBao](https://openbao.org) (open-source Vault fork) and retrieved via `bh_http_get` in SQL. The scoped `bh_http_config` mechanism in blobhttp can inject bearer tokens automatically for URL prefixes, so authenticated API calls look identical to unauthenticated ones.
 
 ### Custom JMESPath functions
 

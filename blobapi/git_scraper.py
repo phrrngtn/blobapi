@@ -259,7 +259,7 @@ def _duckdb_yaml_to_json(blob_contents, extension_path):
     """
     Set-oriented YAML→JSON conversion via DuckDB + blobtemplates extension.
 
-    DuckDB does the yaml_to_json() in parallel (the 100x win over Python YAML).
+    DuckDB does the bt_yaml_to_json() in parallel (the 100x win over Python YAML).
     Returns dict: blob_sha → json_string.
     """
     import duckdb
@@ -274,9 +274,9 @@ def _duckdb_yaml_to_json(blob_contents, extension_path):
 
     t0 = time.monotonic()
     results = duck.execute(
-        "SELECT blob_sha, yaml_to_json(yaml_content) FROM blobs"
+        "SELECT blob_sha, bt_yaml_to_json(yaml_content) FROM blobs"
     ).fetchall()
-    log.info("yaml_to_json: %.2fs for %d blobs", time.monotonic() - t0, len(blob_contents))
+    log.info("bt_yaml_to_json: %.2fs for %d blobs", time.monotonic() - t0, len(blob_contents))
 
     duck.close()
     return {sha: json_str for sha, json_str in results}
