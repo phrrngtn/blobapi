@@ -8,52 +8,70 @@ blobapi is a member of the [BLOB extension family](https://github.com/phrrngtn/r
 
 blobapi makes web APIs look like tables.
 
-Many data sources that *should* be local tables — employee directories, weather observations, address lookups, currency rates — are only accessible through web service interfaces. Each service has its own URL scheme, authentication method, parameter format, and response shape. blobapi unifies them so that a SQL query can join a local database table against a web API result as naturally as joining two local tables.
+Many data sources that *should* be local tables — employee directories, weather observations, address lookups, currency rates, LLM model pricing — are only accessible through web service interfaces. Each service has its own URL scheme, authentication method, parameter format, and response shape. blobapi unifies them so that a SQL query can join a local database table against a web API result as naturally as joining two local tables.
 
 The key idea is that **metadata, not code**, should describe how to talk to each service. Two JMESPath expressions per API operation — one to construct the request, one to reshape the response — are stored as data in the database alongside the OpenAPI spec they describe. The SQL that executes them is generic and source-agnostic.
 
-## Why it works this way
+## Two kinds of adapters
 
-### Scalar function composition
+### HTTP adapters (JMESPath)
 
-The entire pipeline — vault secret retrieval, URL construction, HTTP call, response normalization — composes as scalar functions in a CTE chain:
+For REST APIs with stable schemas. Two expressions per operation:
+- **call_jmespath**: context object → `{url, params}` for the HTTP call
+- **response_jmespath**: response body → common fact schema
 
-```sql
-WITH CREDS AS (
-    SELECT json_extract(
-        (bh_http_get('http://vault:8200/v1/secret/data/blobapi/geocodio',
-            headers := MAP {'X-Vault-Token': token}
-        )).response_body, '$.data.data') AS secret
-),
-LOCATION AS (
-    SELECT (bh_http_get(
-        json_extract_string(secret, '$.base_url') || '/geocode',
-        params := json_object('q', '02458', 'api_key',
-                              json_extract_string(secret, '$.api_key'))
-    )).response_body AS body FROM CREDS
-)
-SELECT
-    json_extract_string(body, '$.results[0].formatted_address') AS address,
-    json_extract(body, '$.results[0].location.lat') AS lat
-FROM LOCATION;
+Different services that return the same kind of data get different adapters but produce identical output schemas. A weather query against Visual Crossing and one against Open-Meteo both produce `{date, temperature, unit_of_measure}`.
+
+### LLM adapters (inja prompt templates)
+
+For unstructured or semi-structured data extraction. Each adapter is a reified function:
+- **prompt_template**: Inja/Jinja2 template rendered with caller params
+- **output_schema**: JSON Schema for response validation (jsoncons Draft 2020-12)
+- **response_jmespath**: reshape validated JSON into the desired structure
+
+The `physical_properties` adapter asks Claude for material properties; the `llm_model_cost` adapter extracts pricing from scraped web pages. The SQL that drives them is the same `llm_adapt()` macro.
+
+## LLM pricing pipeline
+
+A complete system for tracking LLM model costs across providers:
+
+```
+                    ┌─────────────────┐
+                    │  Provider URLs  │  adapters/providers.yaml
+                    │  (pricing pages,│  → llm_provider table (TTST)
+                    │   Jina selectors)│
+                    └────────┬────────┘
+                             │
+              ┌──────────────┼──────────────┐
+              ▼              ▼              ▼
+     ┌────────────┐  ┌────────────┐  ┌────────────┐
+     │  Bifrost   │  │ Jina Reader│  │ Jina Reader│
+     │ /v1/models │  │  + LLM     │  │  + LLM     │
+     │ (bootstrap)│  │ (Python)   │  │ (pure SQL) │
+     └─────┬──────┘  └─────┬──────┘  └─────┬──────┘
+           │               │               │
+           └───────────────┼───────────────┘
+                           ▼
+              ┌──────────────────────┐
+              │ llm_model_price_     │  TTST on PG/SQL Server
+              │ history              │  sys_from/sys_to tracks
+              │ (high-ceremony DB)   │  when prices changed
+              └──────────┬───────────┘
+                         │  ODBC query
+                         ▼
+              ┌──────────────────────┐
+              │ Operational DuckDB   │  Local copy, MERGE
+              │ llm_pricing table    │  from high-ceremony DB
+              └──────────────────────┘
 ```
 
-No stored procedures, no application code, no ORM. Each CTE is one step: get the credential, make the call, extract the result. Because `bh_http_get` is a scalar function, it composes with `json_extract`, `jmespath_search`, and every other expression in the SELECT list.
+**Three data sources** (use whichever is available):
 
-### Metadata-driven adapters
+1. **Bifrost `/v1/models`** — static pricing compiled into the Docker image. Fast, comprehensive (88 providers, 2,566 models), but only updated when Bifrost is rebuilt.
+2. **Jina Reader + LLM (Python)** — `scrape-pricing` command fetches provider pricing pages via [Jina Reader](https://jina.ai/reader/), extracts tables with `X-Target-Selector: table`, and passes the clean markdown to an LLM for structured extraction. Updates the TTST directly via SQLAlchemy.
+3. **Jina Reader + LLM (pure SQL)** — same pipeline but entirely in DuckDB: `bh_http_get` → Jina → `llm_adapt` → structured table.
 
-Each API operation has an adapter — two JMESPath expressions stored in `api_adapter`:
-
-- **call_jmespath**: takes a context object `{base_url, api_key, lat, lng, ...}` and produces `{url, params}` for the HTTP call
-- **response_jmespath**: takes the response body and produces a common fact schema (e.g., `[{date, temperature, unit_of_measure}, ...]`)
-
-Different services that return the same kind of data get different adapters but produce identical output schemas. A weather query against Visual Crossing and one against Open-Meteo both produce `{date, temperature, unit_of_measure}` — the SQL that consumes them doesn't know or care which backend provided the data.
-
-This is the same principle as extended properties in SQL Server: metadata *about* a schema object, stored alongside it, that tells tooling how to interpret or interact with it.
-
-### Why not code-generate the queries?
-
-Because the queries are already generic. The adapter JMESPath expressions are the only per-service configuration, and they're data. Adding a new weather provider means adding a YAML stanza in `adapters/`, not writing a new function or class. The SQL that drives the pipeline reads the adapter from the database and applies it — one query handles any number of backends.
+**Cost accounting**: every `llm_adapt()` call returns `_meta` with `prompt_tokens`, `completion_tokens`, `model`, and `elapsed_seconds`. Join against `llm_pricing` to compute per-query cost in USD.
 
 ## Architecture
 
@@ -70,13 +88,23 @@ Git is the store of record. `sync` rebuilds the catalog from HEAD; `sync --full`
 
 ### TTST (Transaction-Time State Tables)
 
-Every table carries `sys_from` / `sys_to` columns. Each row records when it was current in the database. For specs loaded from git, `sys_from` is the commit timestamp. This enables point-in-time queries: "what did the GitHub API look like on 2024-01-15?" or "when did this endpoint first appear?"
+Every table carries `sys_from` / `sys_to` columns. Each row records when it was current in the database. For specs loaded from git, `sys_from` is the commit timestamp. For pricing data, `sys_from` is the observation time (upper bound on when the price actually changed).
 
-The adapter table is also temporal — when an API changes its response shape and the JMESPath expression is updated, the old version is closed and the new one inserted. A time-aware join gives you the correct adapter for any historical spec version.
+The temporal upsert pattern: compare incoming data against the current row (`sys_to IS NULL`). If unchanged, skip. If different, close the old row (`sys_to = now`) and insert a new one. This makes all operations idempotent and append-only.
+
+### Services
+
+| Service | Purpose | Port | Required for |
+|---|---|---|---|
+| **Bifrost** | LLM gateway (OpenAI-compatible → Anthropic/etc.) | 8080 | LLM calls, pricing bootstrap |
+| **OpenBao** | Secret storage (Vault-compatible) | 8200 | Direct API calls (weather, geocoding) |
+| **Jina Reader** | HTML → clean markdown (JS rendering, table extraction) | — | Pricing scrapes (external service) |
+
+See [docs/llm-setup.md](docs/llm-setup.md) for detailed setup instructions.
 
 ### Secret management
 
-API keys are stored in [OpenBao](https://openbao.org) (open-source Vault fork) and retrieved via `bh_http_get` in SQL. The scoped `bh_http_config` mechanism in blobhttp can inject bearer tokens automatically for URL prefixes, so authenticated API calls look identical to unauthenticated ones.
+API keys are stored in [OpenBao](https://openbao.org) (open-source Vault fork) and retrieved via `bh_http_get` in SQL. For Bifrost-routed LLM calls, OpenBao is only needed during Bifrost's initial API key setup — not at query time.
 
 ### Custom JMESPath functions
 
@@ -89,17 +117,53 @@ Four functions added to the jsoncons JMESPath engine in blobtemplates, available
 | `to_entries(obj)` | `{k:v, ...}` → `[{key:k, value:v}, ...]` |
 | `from_entries(arr)` | Inverse of to_entries |
 
-`zip_arrays` is the critical one: many APIs return columnar/parallel-array responses (Open-Meteo, charting endpoints) to save bandwidth. This function transposes them to the row-oriented format that SQL expects, enabling a uniform response JMESPath across both row-oriented and columnar backends.
-
 ## Usage
 
 ```bash
-uv run python main.py init                  # Create tables
-uv run python main.py sync                  # Load specs from git HEAD
-uv run python main.py catalog               # Fast metadata-only (no YAML parse)
-uv run python main.py adapters              # Load adapter configs from YAML
-uv run python main.py connections           # List configured databases
+# Database setup
+uv run python main.py init                        # Create tables
+uv run python main.py sync                        # Load specs from git HEAD
+uv run python main.py sync --full                 # Full git history TTST
+uv run python main.py catalog                     # Fast metadata-only
+uv run python main.py adapters                    # Load HTTP adapter configs
+uv run python main.py connections                 # List configured databases
+
+# LLM pricing
+uv run python main.py bootstrap-pricing           # Seed from Bifrost + providers.yaml
+uv run python main.py scrape-pricing              # Scrape all providers
+uv run python main.py scrape-pricing anthropic    # Scrape one provider
+
+# DuckDB demos (from blobapi directory)
+duckdb -unsigned -init sql/llm_demo.sql           # Material properties
+duckdb -unsigned -init sql/scrape_pricing_init.sql # Price scraping (pure SQL)
 ```
+
+## SQLAlchemy models
+
+All models target SQLite, DuckDB, PostgreSQL, and SQL Server.
+
+### High-ceremony database (PG/SQL Server)
+
+| Model | Table | Purpose |
+|---|---|---|
+| `ApiRegistry` | `api_registry` | Source registries (APIs.guru, etc.) |
+| `ApiSpec` | `api_spec` | One row per API identity |
+| `ApiPath` | `api_path` | URL paths within a spec |
+| `ApiOperation` | `api_operation` | HTTP methods on paths |
+| `ApiParameter` | `api_parameter` | Query/path/header params |
+| `ApiResponse` | `api_response` | Status codes and schemas |
+| `ApiSchema` | `api_schema` | Reusable component schemas |
+| `GitSpecStaging` | `git_spec_staging` | Fast metadata from git tree walk |
+| `ApiAdapter` | `api_adapter` | JMESPath HTTP adapters (TTST) |
+| `LlmProvider` | `llm_provider` | Provider reference data (TTST) |
+| `LlmModelPriceHistory` | `llm_model_price_history` | Pricing snapshots (TTST) |
+
+### Session-scoped (DuckDB/SQLite)
+
+| Model | Table | Purpose |
+|---|---|---|
+| `LlmAdapter` | `llm_adapter` | Inja prompt templates for `llm_adapt()` |
+| `LlmPricing` | `llm_pricing` | Per-model token costs for cost accounting |
 
 ## Project layout
 
@@ -107,17 +171,36 @@ uv run python main.py connections           # List configured databases
 blobapi/
 ├── blobapi/
 │   ├── models.py              # SQLAlchemy models (TTST, multi-dialect)
+│   ├── bootstrap_pricing.py   # Bifrost bootstrap + provider YAML loading
+│   ├── scrape_pricing.py      # Jina Reader + LLM pricing scraper
 │   ├── git_scraper.py         # Dulwich + DuckDB sync pipeline
 │   ├── loader.py              # Spec shredding into relational tables
 │   ├── config.py              # Connection management from connections.toml
 │   ├── schema_fingerprint.py  # Table-like response classification
 │   └── scraper.py             # HTTP-based scraper (APIs.guru fallback)
 ├── adapters/
-│   └── weather.yaml           # JMESPath adapters for weather APIs
-├── specs/
-│   └── open-meteo-archive.yaml # Manually curated OpenAPI specs
-├── openapi-directory/          # Git submodule (APIs.guru)
-├── main.py                     # CLI entry point
-├── connections.toml.example    # Database connection template
+│   ├── providers.yaml         # Provider slugs, URLs, Jina selectors
+│   ├── physical_properties.yaml # LLM adapter: material property lookup
+│   ├── domain_inference.yaml  # LLM adapter: column domain classification
+│   ├── llm_model_cost.yaml    # LLM adapter: pricing page extraction
+│   ├── llm_pricing.yaml       # Static pricing reference (Anthropic)
+│   └── weather.yaml           # HTTP adapter: weather APIs
+├── sql/
+│   ├── llm_demo.sql           # Physical properties demo (init file)
+│   ├── scrape_pricing_init.sql # Pure-SQL pricing scrape demo
+│   ├── scrape_pricing.sql     # scrape_pricing() DuckDB macro
+│   ├── llm_model_cost.sql     # llm_model_cost() macro (reads Bifrost)
+│   ├── create_llm_adapter.sql # DDL for llm_adapter table
+│   ├── create_llm_pricing.sql # DDL for llm_pricing table
+│   ├── load_llm_adapters.sql  # INSERT adapters from YAML
+│   ├── load_llm_pricing.sql   # INSERT pricing from static YAML
+│   └── load_llm_pricing_from_bifrost.sql # INSERT pricing from Bifrost
+├── docs/
+│   ├── llm-setup.md           # Service setup (Bifrost, OpenBao, DuckDB)
+│   └── jmespath-vs-sql.md     # JMESPath/SQL expressiveness analysis
+├── specs/                     # Manually curated OpenAPI specs
+├── openapi-directory/         # Git submodule (APIs.guru)
+├── main.py                    # CLI entry point (docopt)
+├── connections.toml.example   # Database connection template
 └── pyproject.toml
 ```

@@ -239,3 +239,96 @@ llm_adapt('physical_properties', json_object(...))
   AppRole or Kubernetes auth.
 - For Bifrost-routed LLM calls, OpenBao is only needed during Bifrost's
   initial API key setup — not at query time.
+
+## LLM Pricing Pipeline
+
+### Overview
+
+Three approaches to populating the pricing TTST, in order of fidelity:
+
+1. **Bifrost bootstrap** (`bootstrap-pricing`) — fast, comprehensive, but
+   static per Docker image. Pricing is compiled into `governance_model_pricing`
+   in Bifrost's SQLite DB. Updated only when Bifrost is rebuilt.
+
+2. **Jina Reader + LLM (Python)** (`scrape-pricing`) — fetches live pricing
+   pages, extracts tables, passes to LLM for structured extraction. Updates
+   the high-ceremony TTST directly via SQLAlchemy.
+
+3. **Jina Reader + LLM (pure SQL)** (`scrape_pricing_init.sql`) — same
+   pipeline but entirely in DuckDB. Useful for ad-hoc queries and for
+   operational DuckDB instances that don't have Python.
+
+### Jina Reader
+
+[Jina Reader](https://jina.ai/reader/) converts any URL to clean markdown.
+Prepend `https://r.jina.ai/` to any URL — no API key needed (20 RPM free).
+
+Key headers for our use case:
+
+| Header | Purpose | Example |
+|---|---|---|
+| `X-Target-Selector` | CSS selector — extract only matching elements | `table` |
+| `X-Remove-Selector` | CSS selector — strip before extraction | `nav, footer, .sidebar` |
+
+Using `X-Target-Selector: table` reduces the Anthropic pricing page from
+37,005 chars (218k tokens) to 4,759 chars (~1,500 tokens). This makes LLM
+extraction cheap enough to run from Haiku (~$0.001 per scrape).
+
+Jina config is stored per-provider in `adapters/providers.yaml` under the
+`jina` key.
+
+### Temporal tracking
+
+Prices are tracked via `sys_from` / `sys_to` (transaction-time):
+
+- **Bootstrap**: `sys_from` = Docker image creation timestamp (upper bound
+  on when Bifrost's compiled pricing was set).
+- **Scrape**: `sys_from` = scrape timestamp (upper bound on when the
+  provider actually changed the price).
+- **Current row**: `sys_to IS NULL`.
+- **Idempotent**: re-running skips unchanged rows.
+
+The business key is `model` (provider-prefixed, e.g. `anthropic/claude-opus-4-6`).
+Only one current row per model. A price change closes the old row and opens
+a new one.
+
+### Pricing sources per provider
+
+| Provider | Bifrost | Pricing page | Models API | Notes |
+|---|---|---|---|---|
+| Anthropic | Yes (14 models) | platform.claude.com | /v1/models (no pricing) | No programmatic pricing API |
+| OpenAI | Yes (159 models) | openai.com/api/pricing | /v1/models (no pricing) | |
+| Google Gemini | Yes (51 models) | ai.google.dev/pricing | /v1/models | |
+| Mistral | Yes (51 models) | mistral.ai | /v1/models | |
+| Others | Yes (2,566 total) | Varies | Varies | 88 providers in Bifrost |
+
+### Cost accounting
+
+Every `llm_adapt()` call returns `_meta` with token counts:
+
+```sql
+-- Cost of a query
+SELECT
+    (prompt_tokens * p.input_per_mtok
+     + completion_tokens * p.output_per_mtok) / 1e6 AS cost_usd
+FROM _meta
+JOIN llm_pricing AS p ON 'anthropic/' || _meta.model = p.model;
+```
+
+Anthropic has no programmatic usage/billing API. The `_meta` from our own
+calls is the usage ledger. `metadata.user_id` (opaque string in the request
+body) is the only attribution mechanism — no project ID header exists.
+Workspaces with separate API keys are the intended project-level separation.
+
+### Cache/batch multipliers
+
+Standard Anthropic multipliers (applied only for `provider = 'anthropic'`;
+other providers get NULL for these columns):
+
+| Tier | Multiplier | Relative to |
+|---|---|---|
+| 5-minute cache write | 1.25x | base input |
+| 1-hour cache write | 2.0x | base input |
+| Cache read (hit) | 0.1x | base input |
+| Batch input | 0.5x | base input |
+| Batch output | 0.5x | base output |
