@@ -8,6 +8,8 @@ Usage:
     main.py [-c CONNECTION] bootstrap-pricing [--providers FILE]
                             [--bifrost-url URL] [--container NAME]
                             [--image-created TIMESTAMP]
+    main.py [-c CONNECTION] scrape-pricing [PROVIDER...]
+                            [--model MODEL] [--bifrost-chat URL]
     main.py connections
     main.py -h | --help
 
@@ -17,6 +19,7 @@ Commands:
     catalog             Fast metadata-only catalog (no YAML parse, < 2s).
     adapters            Load adapter YAML files into DB.
     bootstrap-pricing   Seed provider refs + pricing from Bifrost.
+    scrape-pricing      Scrape pricing pages via Jina Reader + LLM extraction.
     connections         List available connections from connections.toml.
 
 Options:
@@ -26,8 +29,10 @@ Options:
     --dir DIR           Path to adapters directory [default: adapters].
     --providers FILE    Path to providers.yaml [default: adapters/providers.yaml].
     --bifrost-url URL   Bifrost /v1/models endpoint [default: http://localhost:8080/v1/models].
+    --bifrost-chat URL  Bifrost chat completions endpoint [default: http://localhost:8080/v1/chat/completions].
     --container NAME    Docker container name for image date [default: bifrost].
     --image-created TIMESTAMP  Override sys_from (ISO 8601).
+    --model MODEL       LLM model for extraction [default: anthropic/claude-haiku-4-5-20251001].
     -h --help           Show this help.
 """
 
@@ -191,6 +196,29 @@ def cmd_bootstrap_pricing(opts):
         session.commit()
 
 
+def cmd_scrape_pricing(opts):
+    from blobapi.scrape_pricing import scrape_all
+
+    engine = _engine(opts["--connection"])
+    Base.metadata.create_all(engine)
+
+    providers = opts["PROVIDER"] or None  # docopt returns [] if none given
+
+    with Session(engine) as session:
+        result = scrape_all(
+            session,
+            providers=providers or None,
+            bifrost_url=opts["--bifrost-chat"],
+            model=opts["--model"],
+        )
+        print(
+            f"Scrape: {result['inserted']} inserted, "
+            f"{result['closed']} closed, {result['skipped']} unchanged, "
+            f"{result['errors']} errors"
+        )
+        session.commit()
+
+
 def cmd_connections(opts):
     config = load_config()
     for name in list_connections(config):
@@ -212,6 +240,8 @@ def main():
         cmd_adapters(opts)
     elif opts["bootstrap-pricing"]:
         cmd_bootstrap_pricing(opts)
+    elif opts["scrape-pricing"]:
+        cmd_scrape_pricing(opts)
     elif opts["connections"]:
         cmd_connections(opts)
     else:

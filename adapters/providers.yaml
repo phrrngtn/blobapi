@@ -5,13 +5,25 @@
 # display name, and a map of well-known URLs.
 #
 # URL categories:
-#   pricing:  published pricing page (for scraping)
+#   pricing:  published pricing page (for scraping via Jina Reader)
 #   models:   machine-readable models/pricing endpoint (if available)
 #   billing:  console billing/usage page (for human reference)
 #   docs:     API documentation
+#
+# Fetch pipeline for pricing scrapes:
+#   1. Prepend "https://r.jina.ai/" to the pricing URL → clean markdown
+#   2. Send Jina headers (target_selector, remove_selector) to narrow content
+#   3. Pass markdown to llm_model_cost adapter for structured extraction
+#
+# Jina headers (per provider):
+#   target_selector:  CSS selector for elements to extract (e.g. "table")
+#   remove_selector:  CSS selector for elements to strip (e.g. "nav, footer")
 
 - provider: anthropic
   display_name: Anthropic
+  jina:
+    target_selector: table
+    remove_selector: nav, footer, .sidebar
   urls:
     pricing: https://platform.claude.com/docs/en/about-claude/pricing
     models: https://api.anthropic.com/v1/models
