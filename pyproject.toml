@@ -14,6 +14,7 @@ dependencies = [
     "duckdb-engine>=0.17.0",
     "dulwich>=1.1.0",
     "docopt-ng>=0.9.0",
+    "playwright>=1.58.0",
 ]
 
 [project.optional-dependencies]

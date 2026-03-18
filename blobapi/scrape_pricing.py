@@ -19,9 +19,9 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from blobapi.browser_extract import BROWSER_CONFIGS, fetch_rendered_text
 from blobapi.model_id import normalize_model_id
 from blobapi.models import LlmModelPriceHistory, LlmProvider
-from blobapi.rsc_extract import RSC_PROVIDERS
 
 log = logging.getLogger(__name__)
 
@@ -254,32 +254,37 @@ def scrape_provider(
     return {"inserted": inserted, "skipped": skipped, "closed": closed, "errors": 0}
 
 
-def scrape_provider_rsc(
+def scrape_provider_browser(
     session: Session,
     provider_slug: str,
-    pricing_url: str,
     now: datetime,
+    bifrost_url: str = DEFAULT_BIFROST_URL,
+    model: str = DEFAULT_MODEL,
 ) -> dict:
     """
-    Scrape a provider that uses Next.js RSC via direct regex extraction.
+    Scrape a provider using headless browser + LLM extraction.
 
-    No Jina, no LLM — just fetch the raw HTML and regex the RSC payload.
-    Cheaper and more reliable than the LLM pipeline for these providers.
+    1. Playwright renders the page (handles tab clicks, JS, etc.)
+    2. Rendered DOM text passed to LLM for structured extraction
+    3. Same TTST upsert logic as the Jina pipeline
     """
-    _, extractor = RSC_PROVIDERS[provider_slug]
-
-    log.info("Fetching %s pricing via direct HTTP (RSC extraction)", provider_slug)
+    log.info("Fetching %s pricing via headless browser", provider_slug)
     try:
-        resp = httpx.get(pricing_url, timeout=30, follow_redirects=True)
-        resp.raise_for_status()
-    except httpx.HTTPError as e:
-        log.error("Failed to fetch %s: %s", pricing_url, e)
+        rendered_text = fetch_rendered_text(provider_slug)
+    except Exception as e:
+        log.error("Browser fetch failed for %s: %s", provider_slug, e)
         return {"inserted": 0, "skipped": 0, "closed": 0, "errors": 1}
 
-    log.info("Extracting %s pricing from RSC payload (%d chars HTML)",
-             provider_slug, len(resp.text))
-    models = extractor(resp.text)
-    log.info("Found %d models for %s", len(models), provider_slug)
+    log.info("Extracting %s pricing via LLM (%d chars of rendered text)",
+             provider_slug, len(rendered_text))
+    try:
+        models = _extract_pricing_via_llm(
+            provider_slug, rendered_text,
+            bifrost_url=bifrost_url, model=model,
+        )
+    except Exception as e:
+        log.error("LLM extraction failed for %s: %s", provider_slug, e)
+        return {"inserted": 0, "skipped": 0, "closed": 0, "errors": 1}
 
     # Build canonical ID set for normalization
     existing_ids = set(
@@ -296,10 +301,19 @@ def scrape_provider_rsc(
     closed = 0
 
     for m in models:
-        model_id = normalize_model_id(m["model_id"], canonical_ids=existing_ids)
+        model_id = m.get("model_id")
+        if not model_id or m.get("input_per_mtok") is None or m.get("output_per_mtok") is None:
+            continue
+
+        model_id = normalize_model_id(model_id, canonical_ids=existing_ids)
         row_data = {
             "input_per_mtok": m["input_per_mtok"],
             "output_per_mtok": m["output_per_mtok"],
+            "cache_write_5m_per_mtok": m.get("cache_write_5m_per_mtok"),
+            "cache_write_1h_per_mtok": m.get("cache_write_1h_per_mtok"),
+            "cache_read_per_mtok": m.get("cache_read_per_mtok"),
+            "batch_input_per_mtok": m.get("batch_input_per_mtok"),
+            "batch_output_per_mtok": m.get("batch_output_per_mtok"),
         }
 
         existing = session.execute(
@@ -355,10 +369,11 @@ def scrape_all(
             log.warning("No pricing URL for %s, skipping", row.provider)
             continue
 
-        # RSC providers: direct regex extraction (no Jina, no LLM)
-        if row.provider in RSC_PROVIDERS:
-            result = scrape_provider_rsc(
-                session, row.provider, pricing_url, now,
+        # Browser-rendered providers: headless Chromium + LLM extraction
+        if row.provider in BROWSER_CONFIGS:
+            result = scrape_provider_browser(
+                session, row.provider, now,
+                bifrost_url=bifrost_url, model=model,
             )
         else:
             # Jina + LLM pipeline
