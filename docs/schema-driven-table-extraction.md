@@ -207,6 +207,29 @@ The **extraction JS is identical** in both controllers — it's the
 TreeWalker + Range.getClientRects() script. Only the injection
 mechanism and callback bridge differ.
 
+### Browser-side domain matching via WASM
+
+The bbox extraction JS can be combined with roaring bitmap domain
+classifiers running in WASM — the
+[roaring-wasm](https://github.com/SalvatorePreviti/roaring-wasm)
+npm package uses the same portable serialization format as CRoaring
+(which blobfilters wraps). Bitmaps serialized in DuckDB via
+`bf_roaring_serialize(bitmap, 'portable')` deserialize directly in
+the browser via `RoaringBitmap32.deserialize("portable", bytes)`.
+
+This enables real-time domain classification of text bboxes in the
+browser: for each bbox, tokenize the text, build a roaring bitmap of
+token hashes, and probe against domain filters sent from the database.
+Performance is ~10,000 probes in under 10ms (WASM is near-native).
+
+The "browsing while hunting" use case: a PySide6 CTP connected to
+Excel sends the domain filters derived from the active workbook's
+named ranges into the browser's isolated world. As the user browses,
+matching tables are highlighted automatically.
+
+Full design: see
+[blobfilters/docs/browser-domain-matching.md](https://github.com/phrrngtn/blobfilters/blob/main/docs/browser-domain-matching.md).
+
 ### Relation to domain inference
 
 The `domain_inference` LLM adapter (already in blobapi) classifies columns
