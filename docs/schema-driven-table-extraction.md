@@ -162,12 +162,33 @@ match them against the pricing schema.
 
 ### Connection to MutationObserver
 
-For dynamic pages where content changes after initial render (infinite
-scroll, lazy loading, real-time updates), a MutationObserver injected
-into the CDP isolated world can watch for new text nodes appearing and
-extract their bounding boxes incrementally. The observer runs in the
-isolated world, invisible to the page, and feeds bbox data back to
-Python via `expose_function` or periodic `Runtime.evaluate` polls.
+For dynamic pages where content changes after initial render (tab clicks,
+infinite scroll, lazy loading), a MutationObserver watches for new text
+nodes and extracts their bounding boxes incrementally. Tested on Mistral's
+pricing page: 352 initial bboxes + 447 mutations after clicking the "API
+pricing" tab, with sub-millisecond timestamps.
+
+The observer + bbox extraction JS is ~60 lines and is universal — the
+same script works in both controller environments:
+
+| | Playwright (Python) | Qt WebEngine (C++/Python) |
+|---|---|---|
+| Inject JS | `page.evaluate(js)` | `page.runJavaScript(js, worldId)` |
+| Isolated world | CDP `Page.createIsolatedWorld` | `worldId` param (1-256) |
+| Persistent injection | `page.add_init_script()` | `QWebEngineScript` with `DocumentReady` |
+| Pre-paint injection | Unreliable (Next.js replaces context) | `DocumentCreation` injection point (reliable) |
+| JS → Python callback | `page.expose_function()` or `Runtime.addBinding` | `QWebChannel` + `setWebChannel(channel, worldId)` |
+| Python → JS | `page.evaluate()` | `runJavaScript()` |
+
+Qt WebEngine is better suited for pre-paint observation because
+`QWebEngineScript` with `DocumentCreation` injection and a specific
+`worldId` survives framework hydration — the isolated world persists
+even when React/Next.js replaces the main world's execution context.
+
+The `QWebChannel` bridge is also richer than Playwright's
+`expose_function` — it's full bidirectional RPC where Python objects
+are directly callable from JS and vice versa. The MutationObserver
+calls `bboxReceiver.onMutation(data)` and it arrives as a Qt signal.
 
 ### Relation to domain inference
 
