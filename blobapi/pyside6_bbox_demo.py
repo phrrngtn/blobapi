@@ -1,9 +1,9 @@
 """
 PySide6 bbox extraction demo.
 
-Demonstrates the same JS extraction as bbox_extract.py (Playwright) but
-using PySide6/Qt WebEngine as the browser host. The extraction JS is
-identical — only the injection mechanism differs.
+Demonstrates the same JS extraction as the Playwright controller but
+using PySide6/Qt WebEngine as the browser host. Both use the shared
+blobboxes browser bundle — only the injection mechanism differs.
 
 IMPORTANT: Qt WebEngine's offscreen platform does not render page content
 properly (the GPU compositor doesn't initialize). This demo requires a
@@ -30,64 +30,14 @@ from PySide6.QtCore import QUrl, QTimer
 from PySide6.QtWebEngineCore import QWebEnginePage, QWebEngineScript
 from PySide6.QtWebEngineWidgets import QWebEngineView
 
-# The extraction JS — identical to bbox_extract.BBOX_EXTRACTION_JS
-# Shared between Playwright and PySide6 controllers.
-SNAPSHOT_JS = """
-(() => {
-    const results = [];
-    const walker = document.createTreeWalker(
-        document.body, NodeFilter.SHOW_TEXT,
-        {
-            acceptNode: (node) => {
-                const text = node.textContent.trim();
-                if (!text || text.length > 200) return NodeFilter.FILTER_REJECT;
-                const parent = node.parentElement;
-                if (!parent) return NodeFilter.FILTER_REJECT;
-                const style = window.getComputedStyle(parent);
-                if (style.display === 'none' || style.visibility === 'hidden'
-                    || style.opacity === '0') return NodeFilter.FILTER_REJECT;
-                return NodeFilter.FILTER_ACCEPT;
-            }
-        }
-    );
-
-    while (walker.nextNode()) {
-        const textNode = walker.currentNode;
-        const text = textNode.textContent.trim();
-        if (!text) continue;
-
-        const range = document.createRange();
-        range.selectNodeContents(textNode);
-        const rects = range.getClientRects();
-        if (rects.length === 0) continue;
-        const rect = rects[0];
-        if (rect.width === 0 || rect.height === 0) continue;
-
-        const parent = textNode.parentElement;
-        const style = window.getComputedStyle(parent);
-
-        results.push({
-            text: text,
-            x: Math.round(rect.x * 10) / 10,
-            y: Math.round(rect.y * 10) / 10,
-            w: Math.round(rect.width * 10) / 10,
-            h: Math.round(rect.height * 10) / 10,
-            font_family: style.fontFamily.split(',')[0].trim().replace(/['\"]/g, ''),
-            font_size: parseFloat(style.fontSize),
-            font_weight: style.fontWeight,
-            color: style.color,
-            tag: parent.tagName.toLowerCase(),
-            t_ms: Math.round(performance.now() * 100) / 100,
-        });
-    }
-
-    return JSON.stringify(results);
-})()
-"""
+from blobboxes.browser import _load_bundle
 
 
 def main():
     url = sys.argv[1] if len(sys.argv) > 1 else "https://mistral.ai/pricing"
+
+    # Load the shared bundle once
+    bundle_js = _load_bundle(full=False)
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)
@@ -99,6 +49,14 @@ def main():
     # view.show()
 
     page = view.page()
+
+    # Inject bundle as a persistent script in ApplicationWorld
+    script = QWebEngineScript()
+    script.setSourceCode(bundle_js)
+    script.setWorldId(QWebEngineScript.ScriptWorldId.ApplicationWorld)
+    script.setInjectionPoint(QWebEngineScript.InjectionPoint.DocumentReady)
+    script.setName("blobboxes-bundle")
+    page.scripts().insert(script)
 
     def on_load_finished(ok):
         if not ok:
@@ -114,7 +72,7 @@ def main():
                 print(f"Extracted {len(bboxes)} text bboxes")
 
                 pricing = [b for b in bboxes
-                           if "$" in b["text"] or b["font_size"] >= 20]
+                           if "$" in b["text"] or b.get("font_size", 0) >= 20]
                 print(f"Pricing-related: {len(pricing)}")
                 for b in sorted(pricing, key=lambda b: (b["y"], b["x"])):
                     print(f"  ({b['x']:7.1f},{b['y']:7.1f}) "
@@ -124,9 +82,9 @@ def main():
 
                 app.quit()
 
-            # Run in ApplicationWorld (isolated from page)
+            # Init + snapshot via the shared bundle
             page.runJavaScript(
-                SNAPSHOT_JS,
+                "blobboxes.init(); JSON.stringify(blobboxes.snapshot())",
                 QWebEngineScript.ScriptWorldId.ApplicationWorld,
                 on_result,
             )
