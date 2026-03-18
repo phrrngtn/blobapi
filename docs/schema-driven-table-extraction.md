@@ -190,6 +190,23 @@ The `QWebChannel` bridge is also richer than Playwright's
 are directly callable from JS and vice versa. The MutationObserver
 calls `bboxReceiver.onMutation(data)` and it arrives as a Qt signal.
 
+### Headless rendering caveat
+
+Qt WebEngine's `offscreen` QPA platform does not initialize the GPU
+compositor properly — pages render as empty (just footer/nav). This
+means PySide6 cannot be used for headless scraping (CI, cron jobs).
+
+For headless use, Playwright's headless Chromium is the right choice —
+it has a purpose-built compositor that works without a display.
+
+PySide6 is the right choice for **interactive** use cases: CTPs in
+Excel, development tools, visual debugging. A working demo is in
+`blobapi/pyside6_bbox_demo.py`.
+
+The **extraction JS is identical** in both controllers — it's the
+TreeWalker + Range.getClientRects() script. Only the injection
+mechanism and callback bridge differ.
+
 ### Relation to domain inference
 
 The `domain_inference` LLM adapter (already in blobapi) classifies columns
