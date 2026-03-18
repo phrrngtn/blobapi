@@ -73,4 +73,4 @@
     additionalProperties: false
 
   response_jmespath: "models"
-  max_tokens: 4096
+  max_tokens: 8192

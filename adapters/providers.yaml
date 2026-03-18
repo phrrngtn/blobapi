@@ -50,29 +50,29 @@
 
 - provider: mistral
   display_name: Mistral AI
-  scrape_status: "broken: JS-rendered pricing, Jina returns empty with table selector"
+  scrape_status: "tested: RSC extraction from mistral.ai/pricing"
   urls:
-    pricing: https://mistral.ai/products/la-plateforme#pricing
+    pricing: https://mistral.ai/pricing
     models: https://api.mistral.ai/v1/models
     docs: https://docs.mistral.ai/
 
 - provider: cohere
   display_name: Cohere
-  scrape_status: untested
+  scrape_status: "tested: RSC extraction from cohere.com/pricing"
   urls:
     pricing: https://cohere.com/pricing
     docs: https://docs.cohere.com/
 
 - provider: xai
   display_name: xAI
-  scrape_status: "broken: model pricing not in table elements, garbled layout"
+  scrape_status: "tested: RSC extraction from docs.x.ai"
   urls:
     pricing: https://docs.x.ai/docs/models
     docs: https://docs.x.ai/
 
 - provider: deepseek
   display_name: DeepSeek
-  scrape_status: "broken: pricing is inline text not tables, URL redirects"
+  scrape_status: "tested: Jina + LLM (inline text, small page)"
   urls:
     pricing: https://api-docs.deepseek.com/quick_start/pricing
     docs: https://platform.deepseek.com/api-docs

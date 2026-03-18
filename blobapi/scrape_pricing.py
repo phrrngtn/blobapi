@@ -21,6 +21,7 @@ from sqlalchemy.orm import Session
 
 from blobapi.model_id import normalize_model_id
 from blobapi.models import LlmModelPriceHistory, LlmProvider
+from blobapi.rsc_extract import RSC_PROVIDERS
 
 log = logging.getLogger(__name__)
 
@@ -92,7 +93,7 @@ Rules:
 
     body = {
         "model": model,
-        "max_tokens": 4096,
+        "max_tokens": 8192,
         "messages": [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": user_prompt},
@@ -215,7 +216,7 @@ def scrape_provider(
 
     for m in models:
         model_id = m.get("model_id")
-        if not model_id or m.get("input_per_mtok") is None:
+        if not model_id or m.get("input_per_mtok") is None or m.get("output_per_mtok") is None:
             continue
 
         model_id = normalize_model_id(model_id, canonical_ids=existing_ids)
@@ -228,6 +229,77 @@ def scrape_provider(
             "cache_read_per_mtok": m.get("cache_read_per_mtok"),
             "batch_input_per_mtok": m.get("batch_input_per_mtok"),
             "batch_output_per_mtok": m.get("batch_output_per_mtok"),
+        }
+
+        existing = session.execute(
+            select(LlmModelPriceHistory).filter_by(model=model_id, sys_to=None)
+        ).scalar_one_or_none()
+
+        if existing and _prices_match(existing, row_data):
+            skipped += 1
+            continue
+
+        if existing:
+            existing.sys_to = now
+            closed += 1
+
+        session.add(LlmModelPriceHistory(
+            model=model_id,
+            sys_from=now,
+            **row_data,
+        ))
+        inserted += 1
+
+    session.flush()
+    return {"inserted": inserted, "skipped": skipped, "closed": closed, "errors": 0}
+
+
+def scrape_provider_rsc(
+    session: Session,
+    provider_slug: str,
+    pricing_url: str,
+    now: datetime,
+) -> dict:
+    """
+    Scrape a provider that uses Next.js RSC via direct regex extraction.
+
+    No Jina, no LLM — just fetch the raw HTML and regex the RSC payload.
+    Cheaper and more reliable than the LLM pipeline for these providers.
+    """
+    _, extractor = RSC_PROVIDERS[provider_slug]
+
+    log.info("Fetching %s pricing via direct HTTP (RSC extraction)", provider_slug)
+    try:
+        resp = httpx.get(pricing_url, timeout=30, follow_redirects=True)
+        resp.raise_for_status()
+    except httpx.HTTPError as e:
+        log.error("Failed to fetch %s: %s", pricing_url, e)
+        return {"inserted": 0, "skipped": 0, "closed": 0, "errors": 1}
+
+    log.info("Extracting %s pricing from RSC payload (%d chars HTML)",
+             provider_slug, len(resp.text))
+    models = extractor(resp.text)
+    log.info("Found %d models for %s", len(models), provider_slug)
+
+    # Build canonical ID set for normalization
+    existing_ids = set(
+        row[0] for row in session.execute(
+            select(LlmModelPriceHistory.model).filter(
+                LlmModelPriceHistory.model.startswith(provider_slug + "/"),
+                LlmModelPriceHistory.sys_to.is_(None),
+            )
+        ).all()
+    )
+
+    inserted = 0
+    skipped = 0
+    closed = 0
+
+    for m in models:
+        model_id = normalize_model_id(m["model_id"], canonical_ids=existing_ids)
+        row_data = {
+            "input_per_mtok": m["input_per_mtok"],
+            "output_per_mtok": m["output_per_mtok"],
         }
 
         existing = session.execute(
@@ -283,13 +355,20 @@ def scrape_all(
             log.warning("No pricing URL for %s, skipping", row.provider)
             continue
 
-        jina = row.urls.get("jina", {}) if row.urls else {}
-        result = scrape_provider(
-            session, row.provider, pricing_url, now,
-            bifrost_url=bifrost_url, model=model,
-            target_selector=jina.get("target_selector"),
-            remove_selector=jina.get("remove_selector"),
-        )
+        # RSC providers: direct regex extraction (no Jina, no LLM)
+        if row.provider in RSC_PROVIDERS:
+            result = scrape_provider_rsc(
+                session, row.provider, pricing_url, now,
+            )
+        else:
+            # Jina + LLM pipeline
+            jina = row.urls.get("jina", {}) if row.urls else {}
+            result = scrape_provider(
+                session, row.provider, pricing_url, now,
+                bifrost_url=bifrost_url, model=model,
+                target_selector=jina.get("target_selector"),
+                remove_selector=jina.get("remove_selector"),
+            )
         for k in totals:
             totals[k] += result[k]
 
