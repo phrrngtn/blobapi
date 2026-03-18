@@ -1,8 +1,12 @@
-# blobreader: on-premises table recovery service
+# Browser Table Extraction
 
-> Data starts in a table, gets rendered through frameworks and CSS into
-> a visual layout. blobreader reverses the pipeline — recovering tabular
-> structure from rendered documents so the data can participate in JOINs.
+> This design has moved to blobboxes where it belongs — the browser is
+> just another document source alongside PDF, and blobboxes owns the
+> bounding box abstraction.
+>
+> See: [blobboxes/docs/browser-table-extraction.md](https://github.com/phrrngtn/blobboxes/blob/main/docs/browser-table-extraction.md)
+>
+> What follows is the original design for reference.
 
 ## What it is
 
