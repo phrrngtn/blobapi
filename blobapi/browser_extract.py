@@ -1,21 +1,24 @@
 """
-Extract pricing data from JS-rendered pages using a headless browser.
+Extract pricing data from JS-rendered pages using a headless browser
+with CDP isolated world injection.
 
-For providers where the pricing is behind tab clicks, in Shadow DOM,
-or rendered client-side, we use Playwright (headless Chromium) to:
+Uses Playwright (headless Chromium) + Chrome DevTools Protocol to:
   1. Navigate to the pricing page
   2. Click any necessary tabs to reveal API pricing
-  3. Extract the rendered DOM text
-  4. Return the text for downstream processing (LLM extraction or regex)
+  3. Create a CDP isolated world (invisible to page scripts)
+  4. Inject extraction JS that queries the rendered DOM
+  5. Return structured data or clean text for LLM extraction
 
-This replaces RSC regex extraction with a more robust approach that
-works with the rendered DOM — the same content a human would see.
+The isolated world is the same mechanism used by Chrome extensions'
+content scripts and Tampermonkey userscripts. The page's React/Next.js
+code cannot detect, block, or interfere with our extraction code.
 
 Requires: playwright + chromium (uv run playwright install chromium)
 """
 
+import json
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 log = logging.getLogger(__name__)
 
@@ -28,8 +31,8 @@ class BrowserScrapeConfig:
     click_selector: str | None = None
     # Wait time (ms) after clicking before extraction
     click_wait_ms: int = 3000
-    # CSS selector to wait for before extracting
-    wait_for_selector: str | None = None
+    # CSS selector to scope text extraction (optional, default: body)
+    content_selector: str | None = None
 
 
 # Per-provider browser configs
@@ -52,12 +55,16 @@ def fetch_rendered_text(
     config: BrowserScrapeConfig | None = None,
 ) -> str:
     """
-    Fetch a provider's pricing page using headless Chromium and return
-    the rendered DOM text.
+    Fetch a provider's pricing page using headless Chromium with a
+    CDP isolated world, and return the rendered DOM text.
 
-    This handles tab clicks, JS rendering, and wait conditions. The
-    returned text is suitable for passing to an LLM for structured
-    extraction, or for direct regex parsing.
+    The extraction runs in an isolated JS execution context that is
+    invisible to the page's own scripts. This prevents anti-scraping
+    detection and ensures our code can't be interfered with by the
+    page's React/Next.js hydration.
+
+    The returned text is suitable for passing to an LLM for structured
+    extraction.
     """
     from playwright.sync_api import sync_playwright
 
@@ -70,10 +77,10 @@ def fetch_rendered_text(
 
     with sync_playwright() as pw:
         browser = pw.chromium.launch(headless=True)
-        page = browser.new_page()
+        context = browser.new_context()
+        page = context.new_page()
 
         page.goto(config.url, wait_until="domcontentloaded", timeout=30000)
-        # Extra wait for JS rendering
         page.wait_for_timeout(5000)
 
         if config.click_selector:
@@ -85,14 +92,35 @@ def fetch_rendered_text(
             else:
                 log.warning("Click selector not found: %s", config.click_selector)
 
-        if config.wait_for_selector:
-            try:
-                page.wait_for_selector(config.wait_for_selector, timeout=10000)
-            except Exception:
-                log.warning("Wait selector not found: %s", config.wait_for_selector)
+        # Create a CDP isolated world for extraction
+        cdp = context.new_cdp_session(page)
+        tree = cdp.send("Page.getFrameTree")
+        frame_id = tree["frameTree"]["frame"]["id"]
 
-        body_text = page.inner_text("body")
-        log.info("Extracted %d chars of rendered text for %s",
+        world = cdp.send("Page.createIsolatedWorld", {
+            "frameId": frame_id,
+            "worldName": f"pricing-extractor-{provider}",
+        })
+        ctx_id = world["executionContextId"]
+        log.info("Created isolated world (context %d) for %s", ctx_id, provider)
+
+        # Extract text from the isolated world
+        selector = config.content_selector or "body"
+        extract_js = f"""
+        (() => {{
+            const el = document.querySelector({json.dumps(selector)});
+            return el ? el.innerText : '';
+        }})()
+        """
+
+        result = cdp.send("Runtime.evaluate", {
+            "expression": extract_js,
+            "contextId": ctx_id,
+            "returnByValue": True,
+        })
+
+        body_text = result["result"]["value"]
+        log.info("Extracted %d chars of rendered text for %s (isolated world)",
                  len(body_text), provider)
 
         browser.close()
