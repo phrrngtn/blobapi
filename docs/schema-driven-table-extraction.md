@@ -130,6 +130,45 @@ This is a general solution — the same machinery works for extracting
 financial tables from SEC filings (PDF), product specs from datasheets
 (XLSX), or API pricing from any web page regardless of how it's rendered.
 
+## Working prototype: bbox_extract.py
+
+A working implementation of step 1 (spatial data extraction from web pages)
+exists in `blobapi/bbox_extract.py`. It uses:
+
+- **Playwright** (headless Chromium) to render JS-heavy pages
+- **CDP isolated worlds** (`Page.createIsolatedWorld`) to inject extraction
+  JS that the page cannot detect or interfere with — same mechanism as
+  Chrome extension content scripts and Tampermonkey userscripts
+- **TreeWalker** to visit every visible text node in the DOM
+- **Range.getClientRects()** to get the bounding rectangle without
+  triggering layout reflow
+
+Each text node yields: bounding rect (x, y, w, h), text content, font
+metrics (family, size, weight, color), and DOM context (tag, class).
+
+Example output for the Mistral pricing page after clicking "API pricing":
+
+```
+y≈460:  "Mistral Large 3" (h3, 24px)  |  "Mistral Small 4" (h3, 24px)
+y≈580:  "Input (/M tokens)" (p, 16px) |  "$0.15" (p, 16px)
+y≈640:  "Output (/M tokens)"          |  "$0.6"
+y≈680:  "Output (/M tokens)" | "$1.5"
+```
+
+The spatial clustering reveals the CSS grid layout — model names in h3
+at 24px, prices in p at 16px, aligned in columns by x-coordinate. A
+table detection algorithm would find these grid-aligned clusters and
+match them against the pricing schema.
+
+### Connection to MutationObserver
+
+For dynamic pages where content changes after initial render (infinite
+scroll, lazy loading, real-time updates), a MutationObserver injected
+into the CDP isolated world can watch for new text nodes appearing and
+extract their bounding boxes incrementally. The observer runs in the
+isolated world, invisible to the page, and feeds bbox data back to
+Python via `expose_function` or periodic `Runtime.evaluate` polls.
+
 ### Relation to domain inference
 
 The `domain_inference` LLM adapter (already in blobapi) classifies columns
