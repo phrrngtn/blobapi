@@ -1,0 +1,189 @@
+# column_classify_and_discover adapter: extends domain_inference with
+# Wikidata domain discovery for the self-bootstrapping classification loop.
+#
+# Input params:
+#   table_name:      name of the table being analyzed
+#   header:          array of column names
+#   data_types:      array of data types (parallel to header)
+#   body:            array of arrays (sample rows; may be empty)
+#   known_domains:   array of domain labels already in the blobfilter vocabulary
+#                    (so the LLM doesn't suggest domains we already have)
+#
+# Output has four sections:
+#   columns:                  role + semantic type per column
+#   pivot_patterns:           groups of columns to UNPIVOT
+#   wikidata_domains:         new Wikidata categories to fetch and shred
+#   normalized_schema:        suggested normalized table structure
+
+- name: column_classify_and_discover
+
+  prompt_template: |
+    You are analyzing a database table to classify its columns and discover
+    what reference data domains would help classify future tables like it.
+
+    Table: {{ table_name }}
+    Columns (with data types): {% for i in range(length(header)) %}
+      {{ header[i] }} ({{ data_types[i] }}){% endfor %}
+
+    {% if length(body) > 0 %}Sample data (JSON array of arrays, in column order above):
+    {{ body }}{% else %}No sample data available — infer from column names and types only.{% endif %}
+
+    The following domains are ALREADY in our vocabulary — do NOT suggest these:
+    {{ known_domains }}
+
+    TASK 1 — COLUMN CLASSIFICATION:
+    For each column, determine:
+    - role: one of "dimension", "measure", "identifier", "temporal", "geographic"
+    - semantic_type: a specific domain like country_name, currency_code, person_name,
+      incident_count, percentage, latitude, etc.
+    - If the column name encodes multiple dimensions (e.g. "fel_assault_vic_60_man"
+      encodes offense_type + person_role + age_group + gender), decompose it into
+      its constituent parts in inferred_dimensions.
+
+    TASK 2 — PIVOT DETECTION:
+    Identify groups of columns that are a pivoted (wide-format) representation.
+    For each group, specify:
+    - The columns involved
+    - What dimension(s) are encoded in the column names
+    - What the measure column should be called
+    - The extracted dimension values per column
+
+    TASK 3 — WIKIDATA DOMAIN DISCOVERY:
+    Suggest Wikidata categories (QIDs) whose member lists would help classify
+    columns in this and similar tables. Only suggest domains NOT already in
+    our vocabulary. For each suggestion:
+    - The Wikidata QID (e.g. Q6256 for countries, Q11344 for chemical elements)
+    - A human-readable label
+    - Which columns from this table would benefit
+    - A SPARQL query hint (the wdt:P31 or wdt:P279 path to use)
+
+    TASK 4 — NORMALIZED SCHEMA:
+    Propose the normalized form of this table after unpivoting. List the
+    dimension columns, measure columns, and the unpivot operations needed.
+
+  output_schema:
+    type: object
+    required: [columns, pivot_patterns, wikidata_domains, normalized_schema]
+    properties:
+      columns:
+        type: array
+        items:
+          type: object
+          required: [column_name, role, semantic_type]
+          properties:
+            column_name:
+              type: string
+            role:
+              type: string
+              enum: [dimension, measure, identifier, temporal, geographic]
+            semantic_type:
+              type: string
+            inferred_dimensions:
+              type: object
+              description: "If the column name encodes multiple dimensions, decompose here"
+              additionalProperties:
+                type: string
+            confidence:
+              type: number
+              minimum: 0
+              maximum: 1
+          additionalProperties: false
+      pivot_patterns:
+        type: array
+        items:
+          type: object
+          required: [pattern_type, columns, category_label, measure_label]
+          properties:
+            pattern_type:
+              type: string
+              enum: [temporal, instance, demographic, version]
+            columns:
+              type: array
+              items:
+                type: string
+            category_label:
+              type: string
+              description: "What the unpivoted dimension column should be called"
+            measure_label:
+              type: string
+              description: "What the unpivoted value column should be called"
+            extracted_values:
+              type: array
+              items:
+                type: object
+                additionalProperties:
+                  type: string
+              description: "Per-column dimension values, parallel to columns array"
+            confidence:
+              type: number
+              minimum: 0
+              maximum: 1
+          additionalProperties: false
+      wikidata_domains:
+        type: array
+        items:
+          type: object
+          required: [wikidata_qid, domain_label, matching_columns, reason]
+          properties:
+            wikidata_qid:
+              type: string
+              pattern: "^Q[0-9]+$"
+            domain_label:
+              type: string
+            matching_columns:
+              type: array
+              items:
+                type: string
+            reason:
+              type: string
+            sparql_hint:
+              type: string
+              description: "Property path for SPARQL query, e.g. wdt:P31 wd:Q6256"
+          additionalProperties: false
+      normalized_schema:
+        type: object
+        required: [dimensions, measures]
+        properties:
+          dimensions:
+            type: array
+            items:
+              type: object
+              required: [name, source]
+              properties:
+                name:
+                  type: string
+                source:
+                  type: string
+                  description: "original_column, unpivoted_from_names, or inferred"
+              additionalProperties: false
+          measures:
+            type: array
+            items:
+              type: object
+              required: [name, source]
+              properties:
+                name:
+                  type: string
+                source:
+                  type: string
+              additionalProperties: false
+          unpivot_operations:
+            type: array
+            items:
+              type: object
+              required: [source_columns, into_dimension, into_measure]
+              properties:
+                source_columns:
+                  type: array
+                  items:
+                    type: string
+                into_dimension:
+                  type: string
+                into_measure:
+                  type: string
+              additionalProperties: false
+        additionalProperties: false
+    additionalProperties: false
+
+  response_jmespath: ""
+  max_tokens: 8192
