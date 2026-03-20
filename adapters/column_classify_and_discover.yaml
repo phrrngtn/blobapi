@@ -22,10 +22,10 @@
     what reference data domains would help classify future tables like it.
 
     Table: {{ table_name }}
-    Columns (with data types): {% for i in range(length(header)) %}
-      {{ header[i] }} ({{ data_types[i] }}){% endfor %}
+    Column names (JSON array): {{ header }}
+    Data types (parallel array): {{ data_types }}
 
-    {% if length(body) > 0 %}Sample data (JSON array of arrays, in column order above):
+    {% if body != "[]" %}Sample data (JSON array of arrays, in column order above):
     {{ body }}{% else %}No sample data available — infer from column names and types only.{% endif %}
 
     The following domains are ALREADY in our vocabulary — do NOT suggest these:

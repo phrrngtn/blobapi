@@ -21,6 +21,7 @@ FROM (
     FROM read_text([
         'adapters/physical_properties.yaml',
         'adapters/domain_inference.yaml',
-        'adapters/llm_model_cost.yaml'
+        'adapters/llm_model_cost.yaml',
+        'adapters/column_classify_and_discover.yaml'
     ])
 );

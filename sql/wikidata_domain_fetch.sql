@@ -18,7 +18,7 @@ CREATE OR REPLACE MACRO wikidata_domain_members(qid) AS TABLE (
             || '} GROUP BY ?label ORDER BY ?label'
             AS query
     ),
-    FETCH AS (
+    SPARQL_RESULT AS (
         SELECT bh_http_get(
             'https://query.wikidata.org/sparql',
             headers := MAP {
@@ -30,7 +30,7 @@ CREATE OR REPLACE MACRO wikidata_domain_members(qid) AS TABLE (
     ),
     PARSED AS (
         SELECT unnest(from_json(body::JSON->'results'->'bindings', '["json"]')) AS binding
-        FROM FETCH
+        FROM SPARQL_RESULT
     )
     SELECT binding->'label'->>'value' AS label,
            CASE WHEN binding->'altLabels'->>'value' != ''
