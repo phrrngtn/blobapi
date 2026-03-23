@@ -181,25 +181,59 @@ SELECT * FROM edgar_company('0000913144');
 SELECT * FROM edgar_company('0001095073');
 SELECT * FROM edgar_company('0000082811');
 
--- BETTER: data-driven, parallel HTTP calls via LATERAL join
--- bh_http_get processes up to 10 concurrent requests per chunk
-SELECT t.ticker, c.*
+-- BETTER: data-driven, parallel HTTP calls via LATERAL join.
+-- bh_http_get processes up to 10 concurrent requests per chunk.
+-- Note: SEC EDGAR has no batch/multi-CIK endpoint, so each CIK
+-- is a separate HTTP request.  For a handful of CIKs this is fine;
+-- for thousands, use the bulk ZIP instead.
+SELECT c.*
 FROM (VALUES ('0000913144'), ('0001095073'), ('0000082811')) AS v(cik),
      LATERAL edgar_company(v.cik) AS c;
-
--- BEST: poll the bulk endpoint once into a local TTST, query locally
--- The HTTP call is a REFRESH operation, not a query:
---   INSERT INTO edgar_company_snapshot (cik, ticker, name, refreshed_at)
---   SELECT cik, ticker, name, NOW() FROM edgar_tickers();
--- Then query the local table:
---   SELECT * FROM edgar_company_snapshot WHERE name LIKE '%RE %';
 ```
 
-Reference data like company tickers changes slowly — poll it daily or
-weekly into a local transaction-time system table (TTST), then query
-the local copy. Never pull 10,000 rows over HTTP just to filter by
-LIKE. The adapter macros are for **refresh**, not for ad-hoc queries
-against remote data.
+### The Right Pattern: Poll → Store → Query Locally
+
+Reference data like company tickers changes slowly.  The adapter
+macros are for **refresh** (poll remote → store local), not for
+ad-hoc queries.  Never pull 10,000 rows over HTTP just to filter.
+
+```sql
+-- ── REFRESH: poll bulk endpoint into a TTST ──────────────────
+-- Run daily/weekly.  sys_from tracks when we observed this state.
+INSERT INTO edgar_company_history (cik, ticker, name, sic, sys_from)
+SELECT cik, ticker, name, NULL AS sic, NOW() AS sys_from
+FROM edgar_tickers();
+
+-- ── QUERY: find companies added since last week ──────────────
+-- The TTST lets you compare snapshots at two points in time.
+WITH CURRENT_SNAPSHOT AS (
+    SELECT DISTINCT ON (cik) cik, ticker, name
+    FROM edgar_company_history
+    WHERE sys_from <= NOW()
+    ORDER BY cik, sys_from DESC
+),
+PREVIOUS_SNAPSHOT AS (
+    SELECT DISTINCT ON (cik) cik, ticker, name
+    FROM edgar_company_history
+    WHERE sys_from <= NOW() - INTERVAL '7 days'
+    ORDER BY cik, sys_from DESC
+)
+SELECT c.cik, c.ticker, c.name
+FROM CURRENT_SNAPSHOT AS c
+LEFT JOIN PREVIOUS_SNAPSHOT AS p USING (cik)
+WHERE p.cik IS NULL;  -- new companies not in last week's snapshot
+
+-- ── QUERY: reinsurance companies (local, instant) ────────────
+SELECT * FROM edgar_company_history
+WHERE sic = '6331'
+  AND sys_to IS NULL;  -- current rows only
+```
+
+For full company details (SIC codes, state, etc.), SEC provides a
+1.5GB nightly bulk ZIP at
+`https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip`
+containing all submissions data.  Poll that into the TTST rather than
+making 10,000 individual API calls.
 
 ### Available Macros
 
