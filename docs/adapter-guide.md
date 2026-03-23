@@ -139,6 +139,68 @@ the `domain.http_adapter` table — the adapter registry is the single
 source of truth. Adding a new adapter to PG makes it available to SQL
 without writing new macro code.
 
+### Inside a Macro
+
+Here's the full source for `edgar_company` — it's just SQL:
+
+```sql
+CREATE OR REPLACE MACRO edgar_company(cik_padded) AS TABLE (
+    SELECT doc->>'cik'                  AS cik,
+           doc->>'name'                 AS name,
+           doc->>'sic'                  AS sic,
+           doc->>'sicDescription'       AS sic_description,
+           doc->>'stateOfIncorporation' AS state,
+           doc->>'fiscalYearEnd'        AS fiscal_year_end,
+           doc->>'category'             AS filer_category,
+           doc->'tickers'               AS tickers_json,
+           doc->'exchanges'             AS exchanges_json
+    FROM (
+        SELECT (bh_http_get(
+            REPLACE(a.url_template, '{{ cik_padded }}', cik_padded),
+            headers := a.default_headers::VARCHAR
+        )).response_body::JSON AS doc
+        FROM pg.domain.http_adapter AS a
+        WHERE a.name = 'edgar_submission'
+    )
+);
+```
+
+The macro looks up its own URL template and headers from the adapter
+registry — the HTTP mechanics (rate limiting, retries, timeouts) are
+handled by the `bh_http_get` infrastructure, not by the macro.
+
+**Important:** Calling `edgar_company` in a loop (one CIK at a time)
+is a performance anti-pattern. Each call makes a separate HTTP request
+to the SEC API. For bulk lookups, use the `edgar_tickers()` macro to
+get all 10,000+ companies in a single request, or use a data-driven
+pattern where DuckDB drives the HTTP calls in parallel:
+
+```sql
+-- ANTI-PATTERN: one HTTP call per row, serial
+SELECT * FROM edgar_company('0000913144');
+SELECT * FROM edgar_company('0001095073');
+SELECT * FROM edgar_company('0000082811');
+
+-- BETTER: data-driven, parallel HTTP calls via LATERAL join
+-- bh_http_get processes up to 10 concurrent requests per chunk
+SELECT t.ticker, c.*
+FROM (VALUES ('0000913144'), ('0001095073'), ('0000082811')) AS v(cik),
+     LATERAL edgar_company(v.cik) AS c;
+
+-- BEST: poll the bulk endpoint once into a local TTST, query locally
+-- The HTTP call is a REFRESH operation, not a query:
+--   INSERT INTO edgar_company_snapshot (cik, ticker, name, refreshed_at)
+--   SELECT cik, ticker, name, NOW() FROM edgar_tickers();
+-- Then query the local table:
+--   SELECT * FROM edgar_company_snapshot WHERE name LIKE '%RE %';
+```
+
+Reference data like company tickers changes slowly — poll it daily or
+weekly into a local transaction-time system table (TTST), then query
+the local copy. Never pull 10,000 rows over HTTP just to filter by
+LIKE. The adapter macros are for **refresh**, not for ad-hoc queries
+against remote data.
+
 ### Available Macros
 
 | Macro | Returns | Example |
