@@ -110,6 +110,43 @@ See `experiments/edgar_domains.py` (imperative) alongside
 `experiments/edgar_domains.sql` (declarative) in the blobfilters repo
 for a side-by-side comparison of the same EDGAR workflow in both styles.
 
+## DuckDB Macros
+
+After registering adapters in PG, source `sql/http_adapt.sql` to get
+convenience macros:
+
+```sql
+ATTACH 'host=/tmp dbname=rule4_test' AS pg (TYPE POSTGRES);
+.read sql/http_adapt.sql
+
+-- All public companies
+SELECT * FROM edgar_tickers() LIMIT 10;
+
+-- Company details by CIK
+SELECT * FROM edgar_company('0000913144');  -- RenaissanceRe
+
+-- Wikidata SPARQL
+SELECT * FROM wikidata_query('
+    SELECT ?item ?label WHERE {
+      ?item wdt:P31 wd:Q3624078 .
+      ?item rdfs:label ?label . FILTER(LANG(?label) = "en")
+    }
+') LIMIT 10;
+```
+
+These macros read their URL templates, headers, and rate limits from
+the `domain.http_adapter` table — the adapter registry is the single
+source of truth. Adding a new adapter to PG makes it available to SQL
+without writing new macro code.
+
+### Available Macros
+
+| Macro | Returns | Example |
+|-------|---------|---------|
+| `edgar_tickers()` | ~10K rows: cik, ticker, name | `SELECT * FROM edgar_tickers()` |
+| `edgar_company(cik)` | 1 row: name, SIC, tickers, state | `SELECT * FROM edgar_company('0000320193')` |
+| `wikidata_query(sparql)` | N rows: label, alt_label, item_uri | `SELECT * FROM wikidata_query('...')` |
+
 ## Links
 
 - [[Resolution Sieve Architecture]] — adapters feed the domain sieve
