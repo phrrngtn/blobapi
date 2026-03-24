@@ -1,0 +1,105 @@
+- name: classify_symbols
+
+  prompt_template: |
+    Classify each value into one of the available domain categories.
+
+    Available domains:
+    {% for d in domains %}
+    - {{ d }}
+    {% endfor %}
+
+    {% if hints %}
+    Context hints: {{ hints }}
+    {% endif %}
+
+    Values to classify:
+    {% for s in symbols %}
+    - {{ s }}
+    {% endfor %}
+
+    Return a JSON object mapping each value to its best-matching domain.
+    If a value doesn't fit any domain, use "unknown".
+    If a value could belong to multiple domains, pick the most specific one.
+
+  output_schema:
+    type: object
+    additionalProperties:
+      type: string
+    description: "Map of value → domain name"
+
+  response_jmespath: "@"
+  max_tokens: 1024
+
+- name: classify_and_partition_symbols
+
+  prompt_template: |
+    You are classifying values extracted from a document into domain categories.
+
+    Available domains:
+    {% for d in domains %}
+    - {{ d.name }}: {{ d.description }}
+    {% endfor %}
+
+    {% if document_type %}
+    Document type: {{ document_type }}
+    {% endif %}
+    {% if hints %}
+    Additional context: {{ hints }}
+    {% endif %}
+
+    Values to classify:
+    {% for s in symbols %}
+    - {{ s }}
+    {% endfor %}
+
+    For each value, determine:
+    1. The primary domain it belongs to
+    2. Your confidence (high, medium, low)
+    3. Any alternative domain it could belong to
+
+    Also determine:
+    - Is there a single dominant domain that most values belong to?
+    - Can the values be partitioned into a small number of domains?
+
+    Return a JSON object with:
+    {
+      "classifications": {
+        "value1": {"domain": "...", "confidence": "high|medium|low", "alt_domain": "..."},
+        ...
+      },
+      "dominant_domain": "... or null",
+      "domain_partition": {"domain1": ["val1", "val2"], "domain2": ["val3"]}
+    }
+
+  output_schema:
+    type: object
+    required: [classifications, dominant_domain, domain_partition]
+    properties:
+      classifications:
+        type: object
+        additionalProperties:
+          type: object
+          required: [domain, confidence]
+          properties:
+            domain:
+              type: string
+            confidence:
+              type: string
+              enum: [high, medium, low]
+            alt_domain:
+              type: string
+          additionalProperties: false
+      dominant_domain:
+        type: string
+        description: "The single domain most values belong to, or null"
+      domain_partition:
+        type: object
+        additionalProperties:
+          type: array
+          items:
+            type: string
+        description: "Values grouped by domain"
+    additionalProperties: false
+
+  response_jmespath: "@"
+  max_tokens: 2048

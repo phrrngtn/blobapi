@@ -23,6 +23,7 @@ FROM (
         'adapters/domain_inference.yaml',
         'adapters/llm_model_cost.yaml',
         'adapters/column_classify_and_discover.yaml',
-        'adapters/intent_to_constraints.yaml'
+        'adapters/intent_to_constraints.yaml',
+        'adapters/classify_symbols.yaml'
     ])
 );
