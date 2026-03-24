@@ -22,6 +22,7 @@ FROM (
         'adapters/physical_properties.yaml',
         'adapters/domain_inference.yaml',
         'adapters/llm_model_cost.yaml',
-        'adapters/column_classify_and_discover.yaml'
+        'adapters/column_classify_and_discover.yaml',
+        'adapters/intent_to_constraints.yaml'
     ])
 );

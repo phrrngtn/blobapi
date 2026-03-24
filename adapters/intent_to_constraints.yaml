@@ -1,0 +1,59 @@
+- name: intent_to_constraints
+
+  prompt_template: |
+    You are a structured data extraction tool for a catastrophe reinsurance system.
+
+    Given a natural language description of a document or query context, extract structured constraints.
+
+    Available peril types: Earthquake, Tropical Cyclone, Flood, Volcanic Eruption, Wildfire, Tsunami, Tornado
+
+    Available domains (for blobfilter loading): insurance_reinsurance, disasters_enriched,
+    countries, world_cities, us_states, us_counties, currencies, financial_metrics,
+    economic_indicators, naics_codes, public_company_names, insurance_companies,
+    airports, admin_regions, family_names, medical_specialties, diseases
+
+    Return a JSON object with these fields (omit empty/null fields):
+
+    User intent: {{ intent }}
+
+  output_schema:
+    type: object
+    properties:
+      peril_types:
+        type: array
+        items:
+          type: string
+        description: "Matching peril types from the available list"
+      countries:
+        type: array
+        items:
+          type: string
+        description: "Country names"
+      regions:
+        type: array
+        items:
+          type: string
+        description: "Region, state, or province names"
+      date_from:
+        type: string
+        description: "Start date YYYY-MM-DD"
+      date_to:
+        type: string
+        description: "End date YYYY-MM-DD"
+      domains:
+        type: array
+        items:
+          type: string
+        description: "Which blobfilter domains to load for classification"
+      expected_columns:
+        type: array
+        items:
+          type: string
+        description: "Likely column names in the document"
+      description:
+        type: string
+        description: "One-line summary of the intent"
+    additionalProperties: false
+
+  response_jmespath: "@"
+  max_tokens: 1024
