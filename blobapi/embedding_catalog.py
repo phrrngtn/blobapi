@@ -72,6 +72,14 @@ class EmbeddingCollectionDef(Base):
             'Columns are available as {{ column_name }}. '
             'e.g. "{{ peril_type }} > {{ country }} > {{ event_date }} > {{ event_name }}"',
     )
+    model_name: Mapped[str | None] = mapped_column(
+        String(100), nullable=True, default="nomic",
+        doc="Embedding model alias (as registered with be_load_model)",
+    )
+    batch_size: Mapped[int | None] = mapped_column(
+        Integer, nullable=True, default=1000,
+        doc="Number of rows to embed and write per batch",
+    )
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
@@ -299,6 +307,173 @@ def generate_embedding_table(engine, collection_name: str):
     metadata.create_all(engine, checkfirst=True)
 
     return table
+
+
+# ── Generic collection population ─────────────────────────────────
+
+def populate_collection(engine, duck, collection_name: str,
+                        source_table: str = "source_data",
+                        pg_conn=None):
+    """Embed and persist a collection from a DuckDB temp table.
+
+    Architecture: DuckDB computes (template rendering + embedding),
+    Python orchestrates batches, PG persists via psycopg2.
+
+    The caller is responsible for:
+    1. Staging data into a DuckDB temp table (any name, default 'source_data')
+    2. Ensuring columns match the catalog's column_types keys
+    3. Loading the embedding model (be_load_model)
+    4. Providing a psycopg2 connection for direct PG writes
+
+    This function:
+    1. Reads the template, columns, batch_size from the catalog
+    2. Renders the template per row via bt_template_render
+    3. Embeds via be_embed
+    4. Writes to PG via psycopg2 (not the scanner)
+    5. Logs progress with timestamps
+
+    Args:
+        engine: SQLAlchemy engine (for catalog reads)
+        duck: duckdb connection (with extensions loaded, model loaded)
+        collection_name: registered collection name
+        source_table: name of DuckDB temp table with source data
+        pg_conn: psycopg2 connection for writes (if None, uses engine)
+    """
+    import logging
+    log = logging.getLogger(__name__)
+
+    # Read catalog metadata
+    with Session(engine) as session:
+        defn = session.get(EmbeddingCollectionDef, collection_name)
+        if not defn:
+            raise ValueError(f"Unknown collection: {collection_name}")
+
+    template = defn.embedding_template
+    col_types = defn.column_types or {}
+    batch_size = defn.batch_size or 1000
+    model = defn.model_name or "nomic"
+    schema = defn.table_schema
+    table_name = defn.table_name
+    emb_col = defn.embedding_column
+    data_cols = [c for c in col_types if c != emb_col]
+
+    if not template:
+        raise ValueError(f"No embedding_template for collection '{collection_name}'")
+
+    log.info(f"Populating '{collection_name}': template='{template}', "
+             f"model={model}, batch_size={batch_size}")
+
+    # Store template in DuckDB variable for clean SQL
+    duck.execute("SET VARIABLE embed_template = ?", [template])
+
+    # Verify source table has required columns
+    source_cols = [r[0] for r in duck.execute(
+        f"SELECT column_name FROM information_schema.columns "
+        f"WHERE table_name = '{source_table}'"
+    ).fetchall()]
+    missing = [c for c in data_cols if c not in source_cols]
+    if missing:
+        raise ValueError(f"Source table '{source_table}' missing columns: {missing}")
+
+    # Add row numbers for batching
+    duck.execute(f"""
+        CREATE OR REPLACE TEMP TABLE _populate_numbered AS
+        SELECT *, ROW_NUMBER() OVER () AS _rn
+        FROM {source_table}
+    """)
+    n_total = duck.execute("SELECT count(*) FROM _populate_numbered").fetchone()[0]
+    log.info(f"  {n_total} rows to embed")
+
+    # Sample template rendering
+    sample = duck.execute(f"""
+        SELECT bt_template_render(getvariable('embed_template'),
+            json_object({', '.join(f"'{c}', {c}" for c in data_cols)})
+        ) FROM _populate_numbered LIMIT 1
+    """).fetchone()[0]
+    log.info(f"  Sample: {sample}")
+
+    # Build the json_object expression for template rendering
+    json_obj_expr = "json_object(" + ", ".join(f"'{c}', {c}" for c in data_cols) + ")"
+
+    # Manage PG connection
+    own_pg = pg_conn is None
+    if own_pg:
+        import psycopg2
+        pg_conn = psycopg2.connect(dbname="rule4_test", host="/tmp")
+
+    pg_cur = pg_conn.cursor()
+    pg_cur.execute(f"DELETE FROM {schema}.{table_name}")
+    pg_conn.commit()
+    log.info(f"  Cleared {schema}.{table_name}")
+
+    # Build INSERT statement
+    all_cols = data_cols + [emb_col]
+    placeholders = ", ".join(["%s"] * len(all_cols))
+    insert_sql = (f"INSERT INTO {schema}.{table_name} "
+                  f"({', '.join(all_cols)}) VALUES ({placeholders})")
+
+    # Batch loop
+    import time
+    n_batches = (n_total + batch_size - 1) // batch_size
+    total_inserted = 0
+    total_errors = 0
+    t_start = time.perf_counter()
+
+    for batch_idx in range(n_batches):
+        rn_start = batch_idx * batch_size + 1
+        rn_end = rn_start + batch_size - 1
+        t_batch = time.perf_counter()
+
+        try:
+            # Compute embeddings in DuckDB
+            select_cols = ", ".join(data_cols)
+            rows = duck.execute(f"""
+                SELECT {select_cols},
+                       be_embed('{model}',
+                           bt_template_render(getvariable('embed_template'),
+                               {json_obj_expr}
+                           )
+                       ) AS {emb_col}
+                FROM _populate_numbered
+                WHERE _rn BETWEEN {rn_start} AND {rn_end}
+            """).fetchall()
+
+            # Write to PG
+            for row in rows:
+                *cols, embedding = row
+                emb_str = "{" + ",".join(str(v) for v in embedding) + "}"
+                pg_cur.execute(insert_sql, (*cols, emb_str))
+            pg_conn.commit()
+
+            batch_elapsed = time.perf_counter() - t_batch
+            total_inserted += len(rows)
+            overall_elapsed = time.perf_counter() - t_start
+            rate = total_inserted / overall_elapsed if overall_elapsed > 0 else 0
+            eta = (n_total - total_inserted) / rate if rate > 0 else 0
+
+            if (batch_idx + 1) % 10 == 0 or batch_idx == 0 or batch_idx == n_batches - 1:
+                log.info(
+                    f"  batch {batch_idx+1}/{n_batches}: {len(rows)} in {batch_elapsed:.1f}s | "
+                    f"total {total_inserted}/{n_total} ({100*total_inserted/n_total:.0f}%) | "
+                    f"{rate:.0f}/sec | ETA {eta:.0f}s"
+                )
+
+        except Exception as e:
+            total_errors += 1
+            log.error(f"  batch {batch_idx+1}/{n_batches} FAILED: {e}")
+            pg_conn.rollback()
+
+    total_elapsed = time.perf_counter() - t_start
+    log.info(f"  Complete: {total_inserted} embedded, {total_errors} errors, "
+             f"{total_elapsed:.0f}s ({total_inserted/total_elapsed:.0f}/sec)")
+
+    # Cleanup
+    duck.execute("DROP TABLE IF EXISTS _populate_numbered")
+    if own_pg:
+        pg_cur.close()
+        pg_conn.close()
+
+    return total_inserted
 
 
 # ── Index management ─────────────────────────────────────────────
