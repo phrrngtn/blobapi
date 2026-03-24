@@ -1,24 +1,38 @@
-"""Populate company embeddings from SEC EDGAR bulk ZIP.
+"""Populate company embedding collection from SEC EDGAR bulk ZIP.
 
-Reads the embedding_template from the catalog, renders it with
-bt_template_render per row, embeds with nomic. Batched with
-progress logging.
-"""
-"""
-Usage: cd blobapi && uv run python tools/populate_companies.py
-Requires: blobembed-duckdb, blobfilters-duckdb, blobtemplates-duckdb packages
-          /tmp/submissions.zip (from SEC EDGAR bulk download)
-          PG running at /tmp with domain schema
+Usage:
+    populate_companies.py [options]
+    populate_companies.py -h | --help
+
+Options:
+    --zip PATH            Path to submissions.zip [default: /tmp/submissions.zip]
+    --pg-dsn DSN          PG connection string [default: host=/tmp dbname=rule4_test]
+    --batch-size N        Rows per batch [default: 1000]
+    --skip-indexes        Don't create indexes after populating
+    --skip-blobfilter     Don't rebuild the blobfilter after populating
+    -h --help             Show this help
+
+Prerequisites:
+    Download the bulk ZIP first:
+        curl -o /tmp/submissions.zip \\
+            "https://www.sec.gov/Archives/edgar/daily-index/bulkdata/submissions.zip" \\
+            -H "User-Agent: your-app/0.1 you@example.com"
+
+Architecture:
+    Python: parse ZIP, stage in DuckDB
+    DuckDB: render template + embed (computation)
+    PG: persist via psycopg2 (fast write)
 """
 import json
 import zipfile
+import os
+import sys
 import time
 import glob
 import logging
-import sys
 import pathlib
 
-import duckdb
+from docopt import docopt
 
 logging.basicConfig(
     format="%(asctime)s %(levelname)s %(message)s",
@@ -28,207 +42,161 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-BATCH_SIZE = 1000
 
-# ── Parse ZIP ────────────────────────────────────────────────────
+def main():
+    args = docopt(__doc__)
+    zip_path = args["--zip"]
+    pg_dsn = args["--pg-dsn"]
+    batch_size = int(args["--batch-size"])
 
-log.info("Parsing bulk ZIP (filtering to companies with SIC codes)...")
-t0 = time.perf_counter()
-companies = []
-skipped = 0
-with zipfile.ZipFile("/tmp/submissions.zip", "r") as zf:
-    entries = [n for n in zf.namelist() if n.startswith("CIK") and n.endswith(".json")]
-    log.info(f"  {len(entries)} JSON entries in ZIP")
-    for i, name in enumerate(entries):
-        if i > 0 and i % 100000 == 0:
-            log.info(f"  parsed {i}/{len(entries)} entries, {len(companies)} kept")
-        try:
-            data = json.loads(zf.read(name))
-            sic = data.get("sic", "")
-            if not sic or sic == "0000":
-                skipped += 1
-                continue
-            cik = str(data.get("cik", "")).zfill(10)
-            tickers = data.get("tickers", [])
-            companies.append((
-                cik,
-                data.get("name", "")[:500],
-                (tickers[0] if tickers else "")[:10],
-                sic[:10],
-                (data.get("sicDescription", "") or "")[:200],
-                (data.get("stateOfIncorporation", "") or "")[:10],
-                (data.get("category", "") or "")[:100],
-            ))
-        except Exception:
-            skipped += 1
-
-elapsed = time.perf_counter() - t0
-log.info(f"  {len(companies)} companies with SIC, {skipped} skipped, {elapsed:.1f}s")
-
-# ── Setup DuckDB + extensions ────────────────────────────────────
-
-log.info("Loading extensions...")
-import blobembed_duckdb, blobfilters_duckdb, blobtemplates_duckdb
-
-MODEL = glob.glob(str(
-    pathlib.Path.home() / ".cache/huggingface/hub/models--nomic-ai--nomic-embed-text-v1.5-GGUF"
-    "/snapshots/*/nomic-embed-text-v1.5.Q8_0.gguf"
-))[0]
-
-duck = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
-duck.execute(f"LOAD '{blobembed_duckdb.extension_path()}'")
-duck.execute(f"LOAD '{blobfilters_duckdb.extension_path()}'")
-duck.execute(f"LOAD '{blobtemplates_duckdb.extension_path()}'")
-duck.execute("INSTALL postgres; LOAD postgres;")
-duck.execute("ATTACH 'host=/tmp dbname=rule4_test' AS pg (TYPE POSTGRES)")
-duck.execute(f"SELECT be_load_model('nomic', '{MODEL}')")
-log.info("  Model loaded, PG attached")
-
-# ── Read embedding template from catalog ─────────────────────────
-
-template_row = duck.execute("""
-    SELECT embedding_template
-    FROM pg.domain.embedding_catalog
-    WHERE collection_name = 'companies'
-""").fetchone()
-
-if not template_row or not template_row[0]:
-    log.error("No embedding_template found for 'companies' collection in catalog")
-    sys.exit(1)
-
-template = template_row[0]
-log.info(f"  Template: {template}")
-
-# ── Verify template renders correctly with a sample ──────────────
-
-duck.execute("""CREATE TEMP TABLE sample_test (
-    cik VARCHAR, company_name VARCHAR, ticker VARCHAR,
-    sic VARCHAR, sic_description VARCHAR, state VARCHAR,
-    filer_category VARCHAR)""")
-duck.execute("INSERT INTO sample_test VALUES (?,?,?,?,?,?,?)", list(companies[0]))
-
-# Store template in a DuckDB variable to avoid quote escaping issues
-duck.execute("SET VARIABLE embed_template = ?", [template])
-
-sample_text = duck.execute("""
-    SELECT bt_template_render(getvariable('embed_template'),
-        json_object(
-            'cik', cik, 'company_name', company_name, 'ticker', ticker,
-            'sic', sic, 'sic_description', sic_description,
-            'state', state, 'filer_category', filer_category
-        )
-    ) FROM sample_test
-""").fetchone()[0]
-log.info(f"  Sample: {sample_text}")
-duck.execute("DROP TABLE sample_test")
-
-# ── Clear target table ───────────────────────────────────────────
-
-duck.execute("DELETE FROM pg.domain.company_embedding")
-log.info("  Cleared company_embedding table")
-
-# ── Embed and insert in batches ──────────────────────────────────
-
-n_batches = (len(companies) + BATCH_SIZE - 1) // BATCH_SIZE
-total_inserted = 0
-total_errors = 0
-t_start = time.perf_counter()
-
-for batch_idx in range(n_batches):
-    batch = companies[batch_idx * BATCH_SIZE : (batch_idx + 1) * BATCH_SIZE]
-    t_batch = time.perf_counter()
-
-    try:
-        duck.execute("DROP TABLE IF EXISTS batch")
-        duck.execute("""CREATE TEMP TABLE batch (
-            cik VARCHAR, company_name VARCHAR, ticker VARCHAR,
-            sic VARCHAR, sic_description VARCHAR, state VARCHAR,
-            filer_category VARCHAR)""")
-        duck.executemany("INSERT INTO batch VALUES (?,?,?,?,?,?,?)", batch)
-
-        # Render the catalog template per row, then embed
-        duck.execute("""
-            INSERT INTO pg.domain.company_embedding
-                (cik, company_name, ticker, sic, sic_description, state,
-                 filer_category, embedding)
-            SELECT cik, company_name, ticker, sic, sic_description, state,
-                   filer_category,
-                   be_embed('nomic',
-                       bt_template_render(getvariable('embed_template'),
-                           json_object(
-                               'cik', cik,
-                               'company_name', company_name,
-                               'ticker', ticker,
-                               'sic', sic,
-                               'sic_description', sic_description,
-                               'state', state,
-                               'filer_category', filer_category
-                           )
-                       )
-                   ) AS embedding
-            FROM batch
-            WHERE length(company_name) > 0
-        """)
-
-        batch_elapsed = time.perf_counter() - t_batch
-        total_inserted += len(batch)
-        overall_elapsed = time.perf_counter() - t_start
-        rate = total_inserted / overall_elapsed if overall_elapsed > 0 else 0
-        eta = (len(companies) - total_inserted) / rate if rate > 0 else 0
-
-        log.info(
-            f"  batch {batch_idx+1}/{n_batches}: {len(batch)} in {batch_elapsed:.1f}s | "
-            f"total {total_inserted}/{len(companies)} ({100*total_inserted/len(companies):.0f}%) | "
-            f"{rate:.0f}/sec | ETA {eta:.0f}s"
-        )
-
-    except Exception as e:
-        total_errors += 1
-        log.error(f"  batch {batch_idx+1}/{n_batches} FAILED: {e}")
-        for row in batch[:3]:
-            log.error(f"    sample: cik={row[0]} name={row[1][:30]} ticker={row[2]} sic={row[3]}")
-
-# ── Summary ──────────────────────────────────────────────────────
-
-total_elapsed = time.perf_counter() - t_start
-n_in_pg = duck.execute("SELECT count(*) FROM pg.domain.company_embedding").fetchone()[0]
-log.info(f"Embedding complete: {n_in_pg} in PG, {total_errors} errors, {total_elapsed:.0f}s")
-
-# Sample: show rendered embedding text for a few insurance companies
-log.info("Insurance/reinsurance (SIC 63xx) — rendered embedding text:")
-for r in duck.execute("""
-    SELECT bt_template_render(getvariable('embed_template'),
-        json_object('cik', cik, 'company_name', company_name, 'ticker', ticker,
-                    'sic', sic, 'sic_description', sic_description,
-                    'state', state, 'filer_category', filer_category)
-    ) AS text
-    FROM pg.domain.company_embedding
-    WHERE sic LIKE '63%'
-    ORDER BY company_name LIMIT 10
-""").fetchall():
-    log.info(f"  {r[0]}")
-
-# ── Rebuild blobfilter ───────────────────────────────────────────
-
-log.info("Rebuilding company name blobfilter...")
-result = duck.execute("""
-    WITH M AS (
-        SELECT json_group_array(label) AS mj FROM (
-            SELECT company_name AS label FROM pg.domain.company_embedding
-            UNION
-            SELECT ticker FROM pg.domain.company_embedding WHERE ticker != ''
-        )
+    import duckdb
+    import psycopg2
+    from sqlalchemy import create_engine
+    from blobapi.embedding_catalog import (
+        register_collection, populate_collection, ensure_indexes,
     )
-    SELECT bf_to_base64(bf_build_json_normalized(mj)) AS fb64,
-           bf_cardinality(bf_build_json_normalized(mj)) AS card
-    FROM M
-""").fetchone()
-duck.execute("""
-    UPDATE pg.domain.enumeration
-    SET filter_b64 = ?, member_count = ?, updated_at = NOW()
-    WHERE domain_name = 'public_company_names'
-""", [result[0], result[1]])
-log.info(f"  Filter rebuilt: {result[1]} members")
 
-duck.close()
-log.info("Done!")
+    engine = create_engine(f"postgresql+psycopg2:///{pg_dsn.split('dbname=')[1].split()[0]}",
+                           connect_args={"host": pg_dsn.split("host=")[1].split()[0]})
+
+    # ── Register collection ───────────────────────────────────────
+    log.info("Registering companies collection...")
+    register_collection(
+        engine,
+        collection_name="companies",
+        table_name="company_embedding",
+        key_column="cik",
+        label_column="company_name",
+        filter_columns={
+            "sic": "in",
+            "sic_description": "contains",
+            "state": "in",
+            "filer_category": "in",
+        },
+        column_types={
+            "cik": "String(10)",
+            "company_name": "Text",
+            "ticker": "String(10)",
+            "sic": "String(10)",
+            "sic_description": "String(200)",
+            "state": "String(10)",
+            "filer_category": "String(100)",
+        },
+        embedding_template=(
+            "{{ sic }} {{ sic_description }} > {{ state }} > "
+            "{{ company_name }} ({{ ticker }}) [CIK {{ cik }}]"
+        ),
+        description="SEC-registered public companies with SIC classification",
+        create_table=True,
+    )
+
+    # ── Parse ZIP ─────────────────────────────────────────────────
+    log.info(f"Parsing {zip_path}...")
+    t0 = time.perf_counter()
+    companies = []
+    skipped = 0
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        entries = [n for n in zf.namelist()
+                   if n.startswith("CIK") and n.endswith(".json")]
+        log.info(f"  {len(entries)} JSON entries in ZIP")
+        for i, name in enumerate(entries):
+            if i > 0 and i % 100000 == 0:
+                log.info(f"  parsed {i}/{len(entries)}, {len(companies)} kept")
+            try:
+                data = json.loads(zf.read(name))
+                sic = data.get("sic", "")
+                if not sic or sic == "0000":
+                    skipped += 1
+                    continue
+                cik = str(data.get("cik", "")).zfill(10)
+                tickers = data.get("tickers", [])
+                companies.append((
+                    cik,
+                    data.get("name", "")[:500],
+                    (tickers[0] if tickers else "")[:10],
+                    sic[:10],
+                    (data.get("sicDescription", "") or "")[:200],
+                    (data.get("stateOfIncorporation", "") or "")[:10],
+                    (data.get("category", "") or "")[:100],
+                ))
+            except Exception:
+                skipped += 1
+
+    log.info(f"  {len(companies)} companies, {skipped} skipped, "
+             f"{time.perf_counter()-t0:.1f}s")
+
+    # ── Setup DuckDB ──────────────────────────────────────────────
+    log.info("Loading extensions...")
+    stderr_fd = os.dup(2)
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    os.dup2(devnull, 2)
+
+    import blobembed_duckdb, blobfilters_duckdb, blobtemplates_duckdb
+
+    MODEL = glob.glob(str(
+        pathlib.Path.home() / ".cache/huggingface/hub/"
+        "models--nomic-ai--nomic-embed-text-v1.5-GGUF"
+        "/snapshots/*/nomic-embed-text-v1.5.Q8_0.gguf"
+    ))[0]
+
+    duck = duckdb.connect(":memory:", config={"allow_unsigned_extensions": "true"})
+    duck.execute(f"LOAD '{blobembed_duckdb.extension_path()}'")
+    duck.execute(f"LOAD '{blobfilters_duckdb.extension_path()}'")
+    duck.execute(f"LOAD '{blobtemplates_duckdb.extension_path()}'")
+    duck.execute("INSTALL postgres; LOAD postgres;")
+    duck.execute(f"ATTACH '{pg_dsn}' AS pg (TYPE POSTGRES)")
+    duck.execute(f"SELECT be_load_model('nomic', '{MODEL}')")
+
+    os.dup2(stderr_fd, 2)
+    os.close(devnull)
+    os.close(stderr_fd)
+    log.info("  Model loaded")
+
+    # ── Stage into DuckDB ─────────────────────────────────────────
+    log.info(f"Staging {len(companies)} companies...")
+    duck.execute("""CREATE TEMP TABLE source_data (
+        cik VARCHAR, company_name VARCHAR, ticker VARCHAR,
+        sic VARCHAR, sic_description VARCHAR, state VARCHAR,
+        filer_category VARCHAR)""")
+    duck.executemany("INSERT INTO source_data VALUES (?,?,?,?,?,?,?)", companies)
+
+    # ── Populate via generic pipeline ─────────────────────────────
+    pg_conn = psycopg2.connect(dbname="rule4_test", host="/tmp")
+    n_inserted = populate_collection(engine, duck, "companies", pg_conn=pg_conn)
+
+    # ── Indexes ───────────────────────────────────────────────────
+    if not args["--skip-indexes"]:
+        log.info("Creating indexes...")
+        ensure_indexes(engine, "companies")
+        log.info("  Done")
+
+    # ── Blobfilter ────────────────────────────────────────────────
+    if not args["--skip-blobfilter"]:
+        log.info("Rebuilding company name blobfilter...")
+        result = duck.execute("""
+            WITH M AS (
+                SELECT json_group_array(label) AS mj FROM (
+                    SELECT company_name AS label
+                    FROM pg.domain.company_embedding
+                    UNION
+                    SELECT ticker FROM pg.domain.company_embedding
+                    WHERE ticker != ''
+                )
+            )
+            SELECT bf_to_base64(bf_build_json_normalized(mj)) AS fb64,
+                   bf_cardinality(bf_build_json_normalized(mj)) AS card
+            FROM M
+        """).fetchone()
+        duck.execute("""UPDATE pg.domain.enumeration
+            SET filter_b64 = ?, member_count = ?, updated_at = NOW()
+            WHERE domain_name = 'public_company_names'""",
+            [result[0], result[1]])
+        log.info(f"  Filter: {result[1]} members")
+
+    pg_conn.close()
+    duck.close()
+    log.info("Done!")
+
+
+if __name__ == "__main__":
+    main()
