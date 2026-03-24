@@ -61,6 +61,17 @@ class EmbeddingCollectionDef(Base):
         JSON,
         doc='{"column_name": "filter_type", ...} where filter_type is "in", "range", or "contains"',
     )
+    column_types: Mapped[dict | None] = mapped_column(
+        JSON, nullable=True,
+        doc='{"column_name": "sqlalchemy_type", ...} e.g. {"event_date": "String(20)", "deaths": "Integer"}. '
+            'Used to generate the embedding table via SQLAlchemy.',
+    )
+    embedding_template: Mapped[str | None] = mapped_column(
+        Text, nullable=True,
+        doc='Inja/Jinja2 template for generating the text to embed. '
+            'Columns are available as {{ column_name }}. '
+            'e.g. "{{ peril_type }} > {{ country }} > {{ event_date }} > {{ event_name }}"',
+    )
     description: Mapped[str | None] = mapped_column(Text, nullable=True)
 
 
@@ -210,6 +221,86 @@ class EmbeddingCatalog:
             return session.execute(count_q).scalar()
 
 
+# ── Table generation from metadata ────────────────────────────────
+
+# Map from string type names (stored in JSON) to SQLAlchemy types
+_TYPE_MAP = {
+    "String": lambda args: String(int(args)) if args else String(200),
+    "Text": lambda _: Text,
+    "Integer": lambda _: Integer,
+    "Float": lambda _: Float,
+    "REAL[]": lambda _: ARRAY(Float),
+}
+
+
+def _parse_type_spec(spec: str):
+    """Parse a type spec like 'String(200)' or 'Integer' into a SA type."""
+    if "(" in spec:
+        name, args = spec.split("(", 1)
+        args = args.rstrip(")")
+    else:
+        name, args = spec, None
+
+    factory = _TYPE_MAP.get(name)
+    if not factory:
+        return String(200)  # safe default
+    result = factory(args)
+    return result if not callable(result) else result
+
+
+def generate_embedding_table(engine, collection_name: str):
+    """Generate (CREATE IF NOT EXISTS) the embedding table from catalog metadata.
+
+    Reads column_types from the catalog entry and creates a table with:
+    - All declared columns (with their types)
+    - key_column as PRIMARY KEY
+    - embedding column as REAL[]
+
+    Returns the reflected SQLAlchemy Table object.
+    """
+    with Session(engine) as session:
+        defn = session.get(EmbeddingCollectionDef, collection_name)
+        if not defn:
+            raise ValueError(f"Unknown collection: {collection_name}")
+
+        schema = defn.table_schema
+        table_name = defn.table_name
+        key_col = defn.key_column
+        label_col = defn.label_column
+        emb_col = defn.embedding_column
+        col_types = defn.column_types or {}
+
+    # Build column list
+    from sqlalchemy import ARRAY as SA_ARRAY
+    from sqlalchemy.dialects.postgresql import REAL as PG_REAL
+
+    columns = []
+
+    # Key column — always first, always primary key
+    key_type = _parse_type_spec(col_types.get(key_col, "Text"))
+    columns.append(Column(key_col, key_type, primary_key=True))
+
+    # Label column (if different from key)
+    if label_col != key_col:
+        label_type = _parse_type_spec(col_types.get(label_col, "Text"))
+        columns.append(Column(label_col, label_type))
+
+    # All other declared columns
+    for col_name, type_spec in col_types.items():
+        if col_name in (key_col, label_col, emb_col):
+            continue
+        columns.append(Column(col_name, _parse_type_spec(type_spec)))
+
+    # Embedding column — always last
+    columns.append(Column(emb_col, SA_ARRAY(Float)))
+
+    metadata = MetaData()
+    table = Table(table_name, metadata, *columns, schema=schema)
+    metadata.create_all(engine, checkfirst=True)
+
+    return table
+
+
 # ── Registration helpers ──────────────────────────────────────────
 
 def register_collection(engine, *,
@@ -220,8 +311,25 @@ def register_collection(engine, *,
                         label_column: str,
                         embedding_column: str = "embedding",
                         filter_columns: dict,
-                        description: str | None = None):
-    """Register an embedding collection in the catalog."""
+                        column_types: dict | None = None,
+                        embedding_template: str | None = None,
+                        description: str | None = None,
+                        create_table: bool = False):
+    """Register an embedding collection in the catalog.
+
+    Args:
+        collection_name: unique name for this collection
+        table_schema: PG schema (default 'domain')
+        table_name: target table name
+        key_column: primary key column
+        label_column: human-readable label column
+        embedding_column: column holding the embedding vector
+        filter_columns: {"col": "in|range|contains"} for query building
+        column_types: {"col": "String(200)|Integer|Float|Text"} for table generation
+        embedding_template: inja template for generating text to embed
+        description: human-readable description
+        create_table: if True, generate the table from column_types
+    """
     EmbeddingCollectionDef.__table__.create(engine, checkfirst=True)
 
     with Session(engine) as session:
@@ -233,9 +341,14 @@ def register_collection(engine, *,
             label_column=label_column,
             embedding_column=embedding_column,
             filter_columns=filter_columns,
+            column_types=column_types,
+            embedding_template=embedding_template,
             description=description,
         ))
         session.commit()
+
+    if create_table and column_types:
+        generate_embedding_table(engine, collection_name)
 
 
 # ── Demo ──────────────────────────────────────────────────────────
@@ -246,7 +359,7 @@ def main():
         connect_args={"host": "/tmp"},
     )
 
-    # Register the disasters collection
+    # Register the disasters collection (existing table)
     register_collection(
         engine,
         collection_name="disasters",
@@ -259,10 +372,46 @@ def main():
             "event_date": "range",
             "hierarchical_path": "contains",
         },
+        column_types={
+            "hierarchical_path": "Text",
+            "event_name": "Text",
+            "peril_type": "String(100)",
+            "country": "String(200)",
+            "event_date": "String(20)",
+        },
+        embedding_template="{{ peril_type }} > {{ country }} > {{ event_date }} > {{ event_name }}",
         description="Enriched natural disaster events with hierarchical paths "
                     "(earthquakes, hurricanes, floods, wildfires, etc.)",
     )
-    print("Registered 'disasters' collection\n")
+    print("Registered 'disasters' collection")
+
+    # Register a hypothetical companies collection — demonstrates table generation
+    register_collection(
+        engine,
+        collection_name="companies",
+        table_name="company_embedding",
+        key_column="cik",
+        label_column="company_name",
+        filter_columns={
+            "sic": "in",
+            "sic_description": "contains",
+            "state": "in",
+            "filer_category": "in",
+        },
+        column_types={
+            "cik": "String(10)",
+            "company_name": "Text",
+            "ticker": "String(10)",
+            "sic": "String(10)",
+            "sic_description": "String(200)",
+            "state": "String(10)",
+            "filer_category": "String(100)",
+        },
+        embedding_template="{{ sic_description }} > {{ state }} > {{ company_name }} ({{ ticker }})",
+        description="SEC-registered public companies with SIC classification",
+        create_table=True,  # generates the table from column_types
+    )
+    print("Registered 'companies' collection (table generated)\n")
 
     catalog = EmbeddingCatalog(engine)
 
