@@ -301,6 +301,81 @@ def generate_embedding_table(engine, collection_name: str):
     return table
 
 
+# ── Index management ─────────────────────────────────────────────
+
+def ensure_indexes(engine, collection_name: str):
+    """Add indexes to an existing embedding table based on catalog metadata.
+
+    Reads filter_columns from the catalog and creates appropriate indexes:
+        "in"       → B-tree index
+        "range"    → B-tree index
+        "contains" → GIN trigram index (requires pg_trgm extension)
+
+    Idempotent — uses CREATE INDEX IF NOT EXISTS. Safe to call on tables
+    that already have some or all indexes.
+
+    Does NOT create indexes on the embedding column — that requires
+    pgvector (HNSW/IVFFlat) and should be done explicitly when the
+    collection is large enough to warrant it.
+    """
+    with Session(engine) as session:
+        defn = session.get(EmbeddingCollectionDef, collection_name)
+        if not defn:
+            raise ValueError(f"Unknown collection: {collection_name}")
+
+        schema = defn.table_schema
+        table_name = defn.table_name
+        filter_spec = defn.filter_columns or {}
+        qualified = f"{schema}.{table_name}"
+
+    with engine.connect() as conn:
+        for col_name, filter_type in filter_spec.items():
+            idx_name = f"ix_{table_name}_{col_name}"
+
+            if filter_type in ("in", "range"):
+                conn.execute(sa_text(
+                    f'CREATE INDEX IF NOT EXISTS {idx_name} '
+                    f'ON {qualified} ({col_name})'
+                ))
+
+            elif filter_type == "contains":
+                # GIN trigram index for substring search
+                # Requires: CREATE EXTENSION IF NOT EXISTS pg_trgm;
+                try:
+                    conn.execute(sa_text(
+                        'CREATE EXTENSION IF NOT EXISTS pg_trgm'
+                    ))
+                    conn.execute(sa_text(
+                        f'CREATE INDEX IF NOT EXISTS {idx_name} '
+                        f'ON {qualified} USING gin ({col_name} gin_trgm_ops)'
+                    ))
+                except Exception:
+                    # Fall back to B-tree if pg_trgm not available
+                    conn.execute(sa_text(
+                        f'CREATE INDEX IF NOT EXISTS {idx_name} '
+                        f'ON {qualified} ({col_name})'
+                    ))
+
+        conn.commit()
+
+
+def ensure_indexes_all(engine):
+    """Add indexes for ALL registered embedding collections.
+
+    Idempotent — safe to run repeatedly.
+    """
+    with Session(engine) as session:
+        collections = session.query(EmbeddingCollectionDef).all()
+        names = [c.collection_name for c in collections]
+
+    for name in names:
+        try:
+            ensure_indexes(engine, name)
+        except Exception as e:
+            # Table may not exist yet — skip silently
+            pass
+
+
 # ── Registration helpers ──────────────────────────────────────────
 
 def register_collection(engine, *,
