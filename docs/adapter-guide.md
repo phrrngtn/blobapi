@@ -243,6 +243,152 @@ making 10,000 individual API calls.
 | `edgar_company(cik)` | 1 row: name, SIC, tickers, state | `SELECT * FROM edgar_company('0000320193')` |
 | `wikidata_query(sparql)` | N rows: label, alt_label, item_uri | `SELECT * FROM wikidata_query('...')` |
 
+## OAuth Authentication (Google APIs)
+
+Google Drive, Sheets, and Docs APIs require OAuth2 bearer tokens. The
+adapter definitions in `adapters/google.yaml` declare `{{ access_token }}`
+and `{{ quota_project }}` template variables in their headers, but the
+reify macros in `sql/google_adapt.sql` handle token injection automatically
+via blobhttp's OpenBao integration.
+
+### Architecture
+
+```
+┌─────────────────────┐
+│  google.yaml        │  7 adapter definitions (URL templates, JMESPath, rate limits)
+└─────────┬───────────┘
+          │
+┌─────────▼───────────┐
+│  google_adapt.sql   │  DuckDB table macros: google_drive_list(), google_sheet_tabs(), etc.
+│                     │  Only need document IDs — no token params
+└─────────┬───────────┘
+          │ bh_http_get() with headers := MAP{'X-Goog-User-Project': ...}
+          │
+┌─────────▼───────────┐
+│  blobhttp           │  Sees vault_path in bh_http_config for googleapis.com
+│                     │  Fetches access_token from OpenBao, injects Authorization header
+│                     │  5-minute in-process cache
+└─────────┬───────────┘
+          │
+┌─────────▼───────────┐
+│  OpenBao            │  secret/blobapi/google_token  → {access_token, expires_at}
+│  (KV v2)            │  secret/blobapi/google        → {client_id, client_secret, refresh_token}
+└─────────────────────┘
+```
+
+### Setup (one-time)
+
+**1. Create a GCP project and OAuth client**
+
+- Create a project (e.g., `meplex-integration`) at console.cloud.google.com
+- Enable the Drive API and Sheets API
+- Create an OAuth consent screen (External, Testing mode)
+- Add your email as a test user
+- Create an OAuth client ID (Desktop app type)
+- Download the client secret JSON
+
+**2. Authorize and store credentials in OpenBao**
+
+Run the one-time authorization flow (opens a browser for consent):
+
+```bash
+uv run python tools/google_oauth_setup.py   # or equivalent
+```
+
+This stores `client_id`, `client_secret`, `refresh_token`, and `token_uri`
+in OpenBao at `secret/blobapi/google`.
+
+**3. Refresh the access token**
+
+Google access tokens expire after 1 hour. Before using the macros,
+refresh the token:
+
+```bash
+uv run python tools/google_token_refresh.py
+```
+
+This reads the OAuth credentials from `secret/blobapi/google`, exchanges
+the refresh token for a fresh access token, and writes it to
+`secret/blobapi/google_token`. blobhttp caches vault secrets for 5
+minutes, so the token must be refreshed before it expires. Run this on
+a timer (cron, launchd) every 45 minutes for unattended use.
+
+### SQL Usage
+
+```sql
+-- Load extensions and macros
+LOAD 'bhttp';
+LOAD 'blobtemplates';
+.read sql/create_http_adapter.sql
+.read sql/load_http_adapters.sql
+.read sql/google_adapt.sql
+
+-- Configure vault-backed auth (once per session)
+SET VARIABLE bh_http_config = google_init();
+
+-- List files in a Drive folder
+SELECT * FROM google_drive_list('1C01bJDPMZfChCJhgUd11W9eF3HVqXjYT');
+
+-- Get metadata for a file
+SELECT * FROM google_drive_metadata('1C01bJDPMZfChCJhgUd11W9eF3HVqXjYT');
+
+-- List tabs in a spreadsheet
+SELECT * FROM google_sheet_tabs('13uaR6lb314XJ7ytIcFAqcjXfeVezstQIpDHBlN9fMuA');
+
+-- Read cell values
+SELECT * FROM google_sheet_values('13uaR6lb...', 'Sheet1!A1:Z50');
+
+-- Compose: folder → spreadsheet tabs in one query
+SELECT f.name AS file_name, t.*
+FROM google_drive_list('1C01bJDPMZfChCJhgUd11W9eF3HVqXjYT') AS f,
+     LATERAL google_sheet_tabs(f.id) AS t
+WHERE f.mime_type = 'application/vnd.google-apps.spreadsheet';
+```
+
+### Explicit token (without vault)
+
+For ad-hoc use without OpenBao, set the bearer token directly:
+
+```sql
+SET VARIABLE bh_http_config = bh_http_config_set_bearer(
+    'https://www.googleapis.com/', 'ya29.a0...');
+SET VARIABLE bh_http_config = bh_http_config_set_bearer(
+    'https://sheets.googleapis.com/', 'ya29.a0...');
+SET VARIABLE google_project = 'meplex-integration';
+
+-- Same macros work — blobhttp uses the bearer token from config
+SELECT * FROM google_drive_list('1C01bJD...');
+```
+
+### Why not a service account?
+
+OpenBao's GCP secrets engine can auto-mint tokens for **service accounts**
+with zero external refresh logic — vault holds the SA key and generates
+tokens on demand. This is the fully automatic path.
+
+However, service accounts can only access files explicitly shared with the
+SA email (e.g., `blobhttp@meplex-integration.iam.gserviceaccount.com`).
+They cannot see files shared with your personal Google account unless you
+re-share each one. For personal Drive folders this is friction; for
+production pipelines with dedicated shared drives it's the right answer.
+
+| Approach | Token refresh | File access | Best for |
+|----------|--------------|-------------|----------|
+| User OAuth + `google_token_refresh.py` | External (cron/manual) | Your personal Drive | Development, ad-hoc |
+| Service account + GCP secrets engine | Fully automatic (vault) | Only explicitly shared files | Production pipelines |
+
+### Why not extension-level auto-refresh?
+
+An earlier design proposed `token_endpoint` / `token_auth_type` config
+fields in blobhttp itself. This was rejected because:
+
+- OpenBao already handles credential minting, rotation, and TTL
+- Automatic refresh is hidden state that violates the extension's
+  side-effect-free principle
+- Supporting OAuth2 + SPNEGO + arbitrary token formats is scope creep
+
+See `blobhttp/docs/TODO-enterprise.md` for the full rationale.
+
 ## Links
 
 - [[Resolution Sieve Architecture]] — adapters feed the domain sieve
@@ -250,3 +396,5 @@ making 10,000 individual API calls.
 - `blobhttp/sql/http_verbs.sql` — bh_http_get/post macro definitions
 - `blobhttp/sql/http_config.sql` — config MAP documentation
 - `blobapi/sql/create_llm_adapter.sql` — LLM adapter DDL (similar pattern)
+- `blobapi/sql/google_adapt.sql` — Google reify macros
+- `blobapi/adapters/google.yaml` — Google adapter definitions
