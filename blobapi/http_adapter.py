@@ -18,6 +18,8 @@ endpoints. The adapters are then queryable from DuckDB via the
 blobhttp macros.
 """
 
+from pathlib import Path
+
 from sqlalchemy import String, Text, Integer, JSON, create_engine, event
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, Session
 
@@ -141,15 +143,51 @@ ADAPTERS = [
 ]
 
 
-def register_adapters(engine, adapters=None):
+def load_adapters_from_yaml(yaml_path):
+    """Load HttpAdapter instances from a YAML file.
+
+    Args:
+        yaml_path: path to a YAML file containing a list of adapter dicts
+
+    Returns:
+        list of HttpAdapter instances
+    """
+    import yaml
+
+    with open(Path(yaml_path)) as f:
+        entries = yaml.safe_load(f)
+
+    return [
+        HttpAdapter(
+            name=e["name"],
+            description=e.get("description"),
+            method=e.get("method", "get"),
+            url_template=e["url_template"],
+            default_headers=e.get("default_headers"),
+            default_params=e.get("default_params"),
+            rate_limit_profile=e.get("rate_limit_profile"),
+            response_jmespath=e.get("response_jmespath"),
+            response_notes=e.get("response_notes"),
+            source=e.get("source"),
+        )
+        for e in entries
+    ]
+
+
+def register_adapters(engine, adapters=None, yaml_paths=None):
     """Register HTTP adapters in PG. Idempotent (uses merge).
 
     Args:
         engine: SQLAlchemy engine
         adapters: list of HttpAdapter instances (default: built-in ADAPTERS)
+        yaml_paths: optional list of YAML file paths to load additional adapters from
     """
     if adapters is None:
-        adapters = ADAPTERS
+        adapters = list(ADAPTERS)
+
+    if yaml_paths:
+        for path in yaml_paths:
+            adapters.extend(load_adapters_from_yaml(path))
 
     HttpAdapter.__table__.create(engine, checkfirst=True)
 
@@ -159,12 +197,22 @@ def register_adapters(engine, adapters=None):
         session.commit()
 
 
+ADAPTERS_DIR = Path(__file__).resolve().parent.parent / "adapters"
+
+# YAML files containing HttpAdapter definitions (url_template-based).
+# ApiAdapter (weather.yaml) and LlmAdapter (prompt_template-based) files
+# are loaded by their own loaders.
+HTTP_ADAPTER_YAMLS = [
+    ADAPTERS_DIR / "google.yaml",
+]
+
+
 if __name__ == "__main__":
-    from sqlalchemy import create_engine
     engine = create_engine("postgresql+psycopg2:///rule4_test",
                            connect_args={"host": "/tmp"})
-    register_adapters(engine)
+
+    register_adapters(engine, yaml_paths=HTTP_ADAPTER_YAMLS)
 
     with Session(engine) as session:
         for a in session.query(HttpAdapter).all():
-            print(f"  {a.name:<30} {a.method:>6} {a.rate_limit_profile or 'none':>6}")
+            print(f"  {a.name:<35} {a.method:>6} {a.rate_limit_profile or 'none':>6}  {a.source or ''}")

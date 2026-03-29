@@ -1,0 +1,119 @@
+# HTTP adapters for Google Drive, Docs, and Sheets APIs.
+#
+# All endpoints require a Bearer token. In production, the token comes
+# from OpenBao (vault_path in bh_http_config). For ad-hoc use, pass it
+# via bh_http_config_set_bearer() or directly in the headers MAP.
+#
+# The X-Goog-User-Project header is required for ADC-style tokens to
+# set the quota/billing project.
+#
+# Template variables:
+#   access_token   — OAuth2 Bearer token
+#   quota_project  — GCP project ID for quota billing
+
+- name: google_drive_list_folder
+  description: List files in a Google Drive folder by folder ID
+  method: get
+  url_template: >-
+    https://www.googleapis.com/drive/v3/files?q=%27{{ folderId }}%27+in+parents&fields=files(id,name,mimeType,modifiedTime,size)&pageSize=100&includeItemsFromAllDrives=true&supportsAllDrives=true
+  default_headers:
+    Authorization: "Bearer {{ access_token }}"
+    X-Goog-User-Project: "{{ quota_project }}"
+  rate_limit_profile: "10/s"
+  response_jmespath: >-
+    files[].{id: id, name: name, mime_type: mimeType, modified: modifiedTime, size: size}
+  response_notes: >-
+    Returns up to 100 files per page. For pagination, check nextPageToken
+    in the response and pass as pageToken parameter.
+  source: "google:drive:v3"
+
+- name: google_drive_file_metadata
+  description: Get metadata for a single file by ID
+  method: get
+  url_template: >-
+    https://www.googleapis.com/drive/v3/files/{{ fileId }}?fields=id,name,mimeType,size,modifiedTime,parents&supportsAllDrives=true
+  default_headers:
+    Authorization: "Bearer {{ access_token }}"
+    X-Goog-User-Project: "{{ quota_project }}"
+  rate_limit_profile: "10/s"
+  response_jmespath: >-
+    {id: id, name: name, mime_type: mimeType, size: size, modified: modifiedTime, parents: parents}
+  response_notes: >-
+    Drive v3 returns minimal fields by default — the fields parameter is required.
+  source: "google:drive:v3"
+
+- name: google_sheet_export_xlsx
+  description: Export a Google Sheet as XLSX binary (for blobboxes ingestion)
+  method: get
+  url_template: >-
+    https://www.googleapis.com/drive/v3/files/{{ fileId }}/export?mimeType=application/vnd.openxmlformats-officedocument.spreadsheetml.sheet
+  default_headers:
+    Authorization: "Bearer {{ access_token }}"
+    X-Goog-User-Project: "{{ quota_project }}"
+  rate_limit_profile: "5/s"
+  response_jmespath: null
+  response_notes: >-
+    Returns binary XLSX content. Feed to blobboxes bb_xlsx() for bbox extraction.
+    Response body is not JSON — do not apply JMESPath.
+  source: "google:drive:v3"
+
+- name: google_doc_export_pdf
+  description: Export a Google Doc as PDF
+  method: get
+  url_template: >-
+    https://www.googleapis.com/drive/v3/files/{{ fileId }}/export?mimeType=application/pdf
+  default_headers:
+    Authorization: "Bearer {{ access_token }}"
+    X-Goog-User-Project: "{{ quota_project }}"
+  rate_limit_profile: "5/s"
+  response_jmespath: null
+  response_notes: >-
+    Returns binary PDF content. Feed to blobboxes bb_pdf() for bbox extraction.
+  source: "google:drive:v3"
+
+- name: google_sheet_tabs
+  description: List sheet tabs (names and IDs) in a spreadsheet
+  method: get
+  url_template: >-
+    https://sheets.googleapis.com/v4/spreadsheets/{{ spreadsheetId }}?fields=sheets.properties
+  default_headers:
+    Authorization: "Bearer {{ access_token }}"
+    X-Goog-User-Project: "{{ quota_project }}"
+  rate_limit_profile: "5/s"
+  response_jmespath: >-
+    sheets[].properties.{title: title, sheet_id: sheetId, row_count: gridProperties.rowCount, column_count: gridProperties.columnCount}
+  response_notes: >-
+    Each element has title (tab name) and sheetId (gid for export URLs).
+  source: "google:sheets:v4"
+
+- name: google_sheet_values
+  description: Read cell values from a sheet range (A1 notation)
+  method: get
+  url_template: >-
+    https://sheets.googleapis.com/v4/spreadsheets/{{ spreadsheetId }}/values/{{ range }}?valueRenderOption=FORMATTED_VALUE
+  default_headers:
+    Authorization: "Bearer {{ access_token }}"
+    X-Goog-User-Project: "{{ quota_project }}"
+  rate_limit_profile: "5/s"
+  response_jmespath: "values[]"
+  response_notes: >-
+    Range in A1 notation, URL-encoded (e.g., Sheet1!A1:Z100).
+    Returns array of row arrays. First row is typically headers.
+  source: "google:sheets:v4"
+
+- name: google_sheet_full_json
+  description: Full spreadsheet with grid data (formatting, merges, dimensions)
+  method: get
+  url_template: >-
+    https://sheets.googleapis.com/v4/spreadsheets/{{ spreadsheetId }}?includeGridData=true
+  default_headers:
+    Authorization: "Bearer {{ access_token }}"
+    X-Goog-User-Project: "{{ quota_project }}"
+  rate_limit_profile: "2/s"
+  response_jmespath: null
+  response_notes: >-
+    Large response. Contains sheets[].data[].rowData[].values[] with
+    effectiveFormat, formattedValue, etc. Use for blobboxes JSON-path
+    ingestion (see google-sheets-to-bboxes.md). Rate-limited more
+    aggressively due to response size.
+  source: "google:sheets:v4"
